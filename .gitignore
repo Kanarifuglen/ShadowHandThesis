@@ -1,0 +1,21 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Machine Learning artifacts
+*.h5
+*.pt
+*.pth
+
+# Plots and debug images
+*.png
+
+# Temporary files
+tmp_*.h5
+debug_joint6_full_sequence.png
+prediction_vs_groundtruth_*.png
+trajectories_sample*.png
+
+# IDE config (if any)
+.idea/
+.vscode/
