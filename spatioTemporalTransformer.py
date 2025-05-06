@@ -46,51 +46,51 @@ def torch_idct_2d(freq, idct_mat):
 
 # === Dataset ===
 class MovementDataset(Dataset):
-    def __init__(self, h5_path, T_obs=T_OBS, T_pred=T_PRED, use_cache=False, cache_file="cached_keys.npy", load_preprocessed=False, subset_size=None):
+    def __init__(self, h5_path, T_obs=T_OBS, T_pred=T_PRED, subset_size=None):
         super().__init__()
         self.T_obs = T_obs
         self.T_pred = T_pred
         self.T_total = T_obs + T_pred
 
-        if load_preprocessed:
-            self.obs_data, self.fut_data = torch.load("preprocessed_data.pt")
-            self.valid_samples = list(range(len(self.obs_data)))
-            self.use_preprocessed = True
-            return
-
         self.h5 = h5py.File(h5_path, 'r')
         all_keys = list(self.h5['movements'].keys())
         print(f"🔎 Total segments in HDF5: {len(all_keys)}")
 
-        self.valid_samples = []  # List of (key, slice_index)
-        for key in all_keys:
-            angles = self.h5['movements'][key]['angles']
-            if angles.shape[0] < self.T_total:
-                continue
-            for t in range(0, angles.shape[0] - self.T_total):
-                obs = angles[t:t + T_obs]
-                fut = angles[t + T_obs:t + T_obs + T_pred]
-                full = np.concatenate([obs, fut], axis=0)
-                if np.std(full) > 1e-3:
-                    self.valid_samples.append((key, t))
-            if subset_size and len(self.valid_samples) >= subset_size:
-                break
-
-        print(f"✅ Usable motion windows: {len(self.valid_samples)}")
-        self.use_preprocessed = False
+        self.valid_samples = all_keys if not subset_size else all_keys[:subset_size]
+        print(f"✅ Using {len(self.valid_samples)} segments")
 
     def __len__(self):
         return len(self.valid_samples)
 
     def __getitem__(self, idx):
-        if self.use_preprocessed:
-            return self.obs_data[idx], self.fut_data[idx]
+        key = self.valid_samples[idx]
+        grp = self.h5['movements'][key]
+        angles = grp['angles'][:].astype(np.float32)
+        valid_length = grp.attrs['valid_length']
 
-        key, t = self.valid_samples[idx]
-        angles = self.h5['movements'][key]['angles'][:].astype(np.float32)
-        obs = angles[t:t + self.T_obs]
-        fut = angles[t + self.T_obs:t + self.T_total]
-        return obs, fut
+        # Only take the valid part of the sequence
+        angles = angles[:valid_length]
+
+        if valid_length < self.T_total:
+            raise ValueError(f"Sequence {key} is too short (has {valid_length} frames, need {self.T_total})")
+
+        obs = angles[:self.T_obs]
+        fut = angles[self.T_obs:self.T_total]
+
+        # Optional: return metadata if needed
+        metadata = {
+            'movement_id': grp.attrs['movement_id'],
+            'movement_name': grp.attrs['movement_name'],
+            'session_id': grp.attrs['session_id'],
+            'subject_id': grp.attrs['subject_id'],
+            'exercise_id': grp.attrs['exercise_id'],
+            'exercise_table': grp.attrs['exercise_table'],
+            'repetition_id': grp.attrs['repetition_id'],
+        }
+
+        return obs, fut, metadata
+
+
 
 # === Utility ===
 def save_preprocessed_dataset(dataset, out_path="preprocessed_data.pt"):

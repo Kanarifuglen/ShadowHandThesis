@@ -37,8 +37,8 @@ def process_mat_file(mat_path):
             movement = movement_data[i]
 
             if movement == 0:
-                if rest_frames_added >= 5:
-                    continue  # Skip more than 5 rest frames
+                if rest_frames_added >= 1:
+                    continue  # Skip more than 1 rest frames
                 rest_dict = {
                     'rh_WRJ1': float(row[NINAPRO_MAPPING['WRIST']['F']]),
                     'rh_WRJ2': float(row[NINAPRO_MAPPING['WRIST']['A']]),

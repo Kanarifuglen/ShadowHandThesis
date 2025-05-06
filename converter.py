@@ -10,6 +10,11 @@ import threading
 import scipy.io as sio
 import numpy as np
 import h5py 
+from collections import defaultdict
+import multiprocessing
+from tqdm import tqdm
+from multiprocessing import Process
+
 
 from shadow_utils import (
     build_dynamic_ranges,
@@ -29,6 +34,8 @@ pause_event = threading.Event()
 pause_event.set()
 
 def debug_print_joint_data(hand_data, frame_number, movement=None, repetition=None):
+    """Debug function to print out joint data per frame"""
+
     print(f"Frame {frame_number} => Movement: {movement}, Repetition: {repetition}")
     for joint, value in sorted(hand_data.__dict__.items()):
         print(f"  {joint}: {value:.2f}")
@@ -45,6 +52,10 @@ def send_from_mat(mat_filename, udp_socket):
 
     current_ranges = build_dynamic_ranges(data, movement_data)
 
+    MAX_STATIC_FRAMES = 300
+    last_movement = None
+    static_frame_counter = 0
+
     for i in range(data.shape[0]):
         pause_event.wait()
         row = data[i, :]
@@ -52,24 +63,23 @@ def send_from_mat(mat_filename, udp_socket):
         rep = int(repetition[i]) if repetition is not None else 0
 
         if movement == 0:
-            rest_dict = {
-                'rh_WRJ1': float(row[NINAPRO_MAPPING['WRIST']['F']]),
-                'rh_WRJ2': float(row[NINAPRO_MAPPING['WRIST']['A']]),
-                'rh_THJ1': 0, 'rh_THJ2': 0, 'rh_THJ3': 0, 'rh_THJ4': 0, 'rh_THJ5': 0,
-                'rh_LFJ5': 0,
-            }
-            for finger in ['FF', 'MF', 'RF', 'LF']:
-                for idx, joint in enumerate(['DIP', 'PIP', 'MCP', 'MCP_A'], 1):
-                    rest_dict[f'rh_{finger}J{idx}'] = SHADOW_REST[finger][joint]
-            hand_data = HandAnglesData.fromDict(rest_dict)
-        else:
-            hand_data = convert_row_to_shadow_angles(row, movement, current_ranges, mat_filename)
+            continue
 
+        if movement != last_movement:
+            static_frame_counter = 0
+            last_movement = movement
+        else:
+            static_frame_counter += 1
+            if static_frame_counter > MAX_STATIC_FRAMES:
+                continue  # Discard frame if movement is static too long
+
+        hand_data = convert_row_to_shadow_angles(row, movement, current_ranges, mat_filename)
         debug_print_joint_data(hand_data, i, movement, rep)
         hand_data.convertToInt()
         packet = hand_data.to_struct()
         udp_socket.sendto(packet, SERVER_ADDRESS_PORT)
         time.sleep(READING_SOCKET_DELAY)
+
 
 def input_thread():
     while True:
@@ -78,7 +88,11 @@ def input_thread():
         elif cmd == 'r': pause_event.set()
         elif cmd == 'q': sys.exit(0)
 
+
+
 def generate_shadow_dataset(mat_filename, output_filename="shadow_dataset.npz"):
+    """Generates a dataset from a single .mat file"""
+
     mat_data = sio.loadmat(mat_filename)
     if 'angles' not in mat_data or 'restimulus' not in mat_data:
         raise ValueError("Missing 'angles' or 'restimulus' in .mat file.")
@@ -136,27 +150,9 @@ def fill_names(movement_items):
     return movement_names
 
 
-
-
-from collections import defaultdict
-
-import multiprocessing
-import h5py
-import os
-import numpy as np
-import scipy.io as sio
-from collections import defaultdict
-
-from collections import defaultdict
-from tqdm import tqdm
-
-from collections import defaultdict
-from tqdm import tqdm
-
-from collections import defaultdict
-from tqdm import tqdm
-
 def fill_dataset_worker(m_id, mat_files, joint_names, movement_names_dict, output_path):
+    """Thread which job is to fill out a hp5y file for exercise A, B or C"""
+
     movement_instance_counts = defaultdict(int)
 
     with h5py.File(output_path, "w") as h5f:
@@ -214,14 +210,17 @@ def fill_dataset_worker(m_id, mat_files, joint_names, movement_names_dict, outpu
             except Exception:
                 continue
 
-        # Optional: print summary once at end
+        #print summary once at end
         total = sum(movement_instance_counts.values())
         tqdm.write(f"[{m_id}] ✅ Done: {total} movement segments written.")
 
 
-from multiprocessing import Process
+
 def export_full_dataset_to_hdf5():
-    DATA_DIR = "/mnt/c/Users/Jarle Andre/Documents/Informatikk/kinematics_dataset"
+    """Method which parses through every .mat file in the ninapro dataset and converts them to one shadow hand angles dataset. Each thread handles their own set of exercises, before combing into 
+    one final dataset at the end"""
+
+    DATA_DIR = "/mnt/c/Master/ShadowHandMotionPrediction-1/kinematics_dataset"
     output_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "exercise_shadow_dataset.h5")
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
@@ -320,6 +319,8 @@ def main():
 
     if mode == "send":
         mat_filename = sys.argv[2]
+        if not os.path.isfile(mat_filename):
+            mat_filename = os.path.join("kinematics_send", mat_filename)
         udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         threading.Thread(target=input_thread, daemon=True).start()
         send_from_mat(mat_filename, udp_socket)
@@ -328,7 +329,7 @@ def main():
         mat_filename = sys.argv[2]
         output_filename = os.path.splitext(mat_filename)[0] + "_shadow_dataset.npz"
         generate_shadow_dataset(mat_filename, output_filename)
-    elif mode == "export-hdf5":
+    elif mode == "export-all":
         export_full_dataset_to_hdf5()
     else:
         print(f"❌ Unknown mode: {mode}")

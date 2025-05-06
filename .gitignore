@@ -6,6 +6,10 @@ __pycache__/
 *.h5
 *.pt
 *.pth
+*.mat
+*.csv
+*.json
+*.zip
 
 # Plots and debug images
 *.png
