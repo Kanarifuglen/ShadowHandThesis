@@ -1,14 +1,16 @@
 import os
 import time
+import sys
 import numpy as np
 import threading
 import scipy.io as sio
+import scipy.interpolate as interp
 from shadow_utils import (
     scan_dataset_for_ranges,
     convert_row_to_shadow_angles,
     get_baseline_hand_data,
     set_shadow_rest_baseline,
-    downsample_indices
+    resample_sequence
 )
 
 IP_SERVER = "127.0.0.1"
@@ -26,13 +28,10 @@ def debug_print_joint_data(hand_data, frame_number, movement=None, repetition=No
         print(f"  {joint}: {value:.2f}")
 
 
-
-def send_from_mat(mat_filename, udp_socket):
-    # 🔄 Determine baseline file first
+def send_from_mat(mat_filename, udp_socket, target_frames=130):
     mat_dir = os.path.dirname(mat_filename) or '.'
-    subject_prefix = mat_filename.split('_')[0]  # e.g., "S1"
+    subject_prefix = mat_filename.split('_')[0]
     mat_files = [f for f in os.listdir(mat_dir) if f.endswith(".mat") and f.startswith(subject_prefix)]
-
 
     has_e1 = any("_E1_" in f for f in mat_files)
     has_e2 = any("_E2_" in f for f in mat_files)
@@ -64,7 +63,7 @@ def send_from_mat(mat_filename, udp_socket):
 
     set_shadow_rest_baseline(e_angles, e_movements, e_repetitions)
 
-    # 🔍 Load the actual file to process
+    # === load main data ===
     mat_data = sio.loadmat(mat_filename)
     if 'angles' not in mat_data or 'restimulus' not in mat_data:
         print(".mat file missing 'angles' or 'restimulus'")
@@ -81,7 +80,7 @@ def send_from_mat(mat_filename, udp_socket):
     print("Scanning dataset for min/max per finger + joint...")
     scan_dataset_for_ranges(data)
 
-    # 🚀 Send initial baseline hand data once
+    # === send baseline once ===
     hand_data = get_baseline_hand_data()
     hand_data.convertToInt()
     packet = hand_data.to_struct()
@@ -98,33 +97,27 @@ def send_from_mat(mat_filename, udp_socket):
 
         if movement == 0 or rep == 0:
             i += 1
-            continue  # Skip rest frames and invalid repetitions
+            continue
 
-        # Determine if current file is Table B (for skipping logic)
-        if "_E1_" in mat_filename:
-            is_table_b = True
-        elif "_E2_" in mat_filename and has_e3:
-            is_table_b = True
-        else:
-            is_table_b = False
-
+        # skip logic
+        is_table_b = "_E1_" in mat_filename or ("_E2_" in mat_filename and has_e3)
         if is_table_b and movement in skip_movements_b:
             print(f"⏭️ Skipping movement {movement} (Table B skip)")
             while i < len(movement_data) and movement_data[i] == movement:
                 i += 1
             continue
 
-        # ▶️ Detect repetition boundaries
         start = i
         while i < len(movement_data) and movement_data[i] == movement:
             i += 1
         end = i
 
-        # ✅ Downsample indices for this repetition
-        ds_idx = downsample_indices(end - start, target_frames=300)
+        #  extract original raw segment
+        raw_segment = data[start:end, :]
+        print(f"➡️ Resampling movement {movement}, rep {rep} from {end-start} → 130 frames...")
+        resampled_segment = resample_sequence(raw_segment, target_frames)
 
-        # 🚨 Inject baseline frames to reset before each repetition
-        print(f"➡️ New repetition detected (Movement {movement}, Rep {rep}), resetting...")
+        #  inject RESET frames
         baseline_hand_data = convert_row_to_shadow_angles(data[0, :], 0, rep, mat_filename)
         for _ in range(RESET_FRAMES):
             debug_print_joint_data(baseline_hand_data, start, 0, 0)
@@ -133,17 +126,17 @@ def send_from_mat(mat_filename, udp_socket):
             udp_socket.sendto(packet, SERVER_ADDRESS_PORT)
             time.sleep(READING_SOCKET_DELAY)
 
-        # 🎯 Now process downsampled frames in this repetition
-        for idx in ds_idx:
+        #  send resampled frames
+        for row_idx, row in enumerate(resampled_segment):
             pause_event.wait()
-            row = data[start + idx, :]
             hand_data = convert_row_to_shadow_angles(row, movement, rep, mat_filename)
-            debug_print_joint_data(hand_data, start + idx, movement, rep)
+            debug_print_joint_data(hand_data, f"{start}+{row_idx}", movement, rep)
             hand_data.convertToInt()
             packet = hand_data.to_struct()
             udp_socket.sendto(packet, SERVER_ADDRESS_PORT)
             time.sleep(READING_SOCKET_DELAY)
 
+    print("✅ Finished sending all movements.")
 
 def input_thread():
     while True:

@@ -10,6 +10,8 @@ from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from scipy.fftpack import dct, idct
+import json
+import random 
 
 # === Config ===
 T_OBS = 30  # Number of observed frames
@@ -24,31 +26,105 @@ PROGRESSIVE_STAGES = [
 ]
 THUMB_JOINTS = [2, 3, 4, 5, 6]  # Joints that need special handling
 
-# === Improved DCT & iDCT ===
-def apply_dct_2d(time_seq):
-    """Apply DCT to a 2D temporal sequence along time dimension."""
-    T, D = time_seq.shape
-    out = np.zeros_like(time_seq, dtype=np.float32)
-    for d in range(D):
-        out[:, d] = dct(time_seq[:, d], type=2, norm='ortho')
-    return out
 
-def apply_idct_2d(freq_seq):
-    """Apply inverse DCT to a 2D frequency sequence along freq dimension."""
-    T, D = freq_seq.shape
-    out = np.zeros_like(freq_seq, dtype=np.float32)
-    for d in range(D):
-        out[:, d] = idct(freq_seq[:, d], type=2, norm='ortho')
-    return out
+#def apply_dct_2d(time_seq):
+#    """"Apply DCT to a 2D temporal sequence along time dimension."""
+#    time_seq = time_seq.astype(np.float32)  # Add this line
+#    T, D = time_seq.shape
+#    out = np.zeros_like(time_seq, dtype=np.float32)  
+#    for d in range(D):
+#        out[:, d] = dct(time_seq[:, d], type=2, norm='ortho')
+#    return out
+
+#def apply_idct_2d(freq_seq):
+#    """Apply inverse DCT to a 2D frequency sequence along freq dimension."""
+#    freq_seq = freq_seq.astype(np.float32)  
+#    T, D = freq_seq.shape
+#    out = np.zeros_like(freq_seq, dtype=np.float32)
+#    for d in range(D):
+#        out[:, d] = idct(freq_seq[:, d], type=2, norm='ortho')
+#    return out
+
+
+def build_dct_matrix(N):
+    """Build a matrix to perform DCT via matrix multiplication.
+    
+    Based on implementation from Mao et al. 
+    Source: https://github.com/wei-mao-2019/LearnTrajDep
+    """
+    dct_m = np.zeros((N, N))
+    for k in range(N):
+        for i in range(N):
+            if k == 0:
+                dct_m[k, i] = 1.0 / np.sqrt(N)
+            else:
+                dct_m[k, i] = np.sqrt(2.0/N) * np.cos(np.pi * k * (2 * i + 1) / (2 * N))
+    return torch.from_numpy(dct_m.astype(np.float32))
 
 def build_idct_matrix(N):
     """Build a matrix to perform inverse DCT via matrix multiplication."""
     mat = torch.zeros(N, N, dtype=torch.float32)
     for n in range(N):
         for k in range(N):
-            alpha = math.sqrt(1.0/N) if k == 0 else math.sqrt(2.0/N)
-            mat[n, k] = alpha * math.cos(math.pi*(2*n+1)*k/(2.0*N))
+            alpha = torch.tensor(math.sqrt(1.0/N) if k == 0 else math.sqrt(2.0/N), 
+                                dtype=torch.float32) 
+            cos_val = torch.tensor(math.cos(math.pi*(2*n+1)*k/(2.0*N)), 
+                                  dtype=torch.float32) 
+            mat[n, k] = alpha * cos_val
     return mat
+
+def batch_dct_transform(tensor, dct_m):
+    """Apply DCT to a batch of sequences via matrix multiplication.
+    
+    Adapted from Mao et al. (2019) "Learning Trajectory Dependencies for Human Motion Prediction"
+    Source: https://github.com/wei-mao-2019/LearnTrajDep
+    
+    Args:
+        tensor: Input tensor of shape (B, N, D) where B is batch size,
+               N is sequence length, and D is feature dimension
+        dct_m: DCT transformation matrix of shape (N', N)
+               
+    Returns:
+        DCT coefficients of shape (B, N', D)
+    """
+    B, N, D = tensor.shape
+    
+    # Reshape to apply transformation to each sequence in the batch
+    x = tensor.reshape(-1, N).transpose(0, 1)  # (N, B*D)
+    
+    # Apply DCT matrix
+    y = torch.matmul(dct_m, x)  # (N', B*D)
+    
+    # Reshape back to original batch format
+    y = y.transpose(0, 1).reshape(B, -1, D)  # (B, N', D)
+    
+    return y
+
+def batch_idct_transform(tensor, idct_m):
+    """Apply IDCT to a batch of sequences via matrix multiplication.
+    
+    Adapted from Mao et al. (2019) "Learning Trajectory Dependencies for Human Motion Prediction"
+    Source: https://github.com/wei-mao-2019/LearnTrajDep
+    
+    Args:
+        tensor: Input DCT coefficients of shape (B, N, D)
+        idct_m: IDCT transformation matrix of shape (N', N)
+               
+    Returns:
+        Time domain signals of shape (B, N', D)
+    """
+    B, N, D = tensor.shape
+    
+    # Reshape to apply transformation
+    x = tensor.reshape(-1, N).transpose(0, 1)  # (N, B*D)
+    
+    # Apply IDCT matrix
+    y = torch.matmul(idct_m, x)  # (N', B*D)
+    
+    # Reshape back to original batch format
+    y = y.transpose(0, 1).reshape(B, -1, D)  # (B, N', D)
+    
+    return y
 
 def torch_idct_2d(freq, idct_mat):
     """Apply inverse DCT using matrix multiplication in PyTorch.
@@ -78,7 +154,7 @@ def torch_idct_2d(freq, idct_mat):
 # === Improved Dataset ===
 class MovementDataset(Dataset):
     def __init__(self, h5_path, T_obs=T_OBS, T_pred=T_PRED, subset_size=None, 
-                 prefiltered=False, filtered_keys=None):
+                 prefiltered=True, filtered_keys=None):
         super().__init__()
         self.T_obs = T_obs
         self.T_pred = T_pred
@@ -146,6 +222,9 @@ class MovementDataset(Dataset):
         # Get observation and future sequences
         obs = angles[:self.T_obs]
         fut = angles[self.T_obs:self.T_total]
+
+        obs = torch.tensor(obs, dtype=torch.float32)
+        fut = torch.tensor(fut, dtype=torch.float32)
         
         # Safety check: pad if needed
         if obs.shape[0] < self.T_obs:
@@ -462,6 +541,102 @@ class HandDCTMotionModel(nn.Module):
         
         return output
 
+
+
+# === Data Splitting Functions for Proper Evaluation ===
+def create_subject_split(dataset, test_subjects=None, test_ratio=0.2):
+    """Split dataset by subject_id"""
+    # Get unique subjects
+    unique_subjects = set()
+    for key in dataset.valid_samples:
+        subject = dataset.h5['movements'][key].attrs.get('subject_id', "Unknown")
+        unique_subjects.add(subject)
+    unique_subjects = list(unique_subjects)
+    
+    # If no test subjects provided, randomly select some
+    if test_subjects is None:
+        num_test_subjects = max(1, int(len(unique_subjects) * test_ratio))
+        random.shuffle(unique_subjects)
+        test_subjects = unique_subjects[:num_test_subjects]
+    
+    # Create the split
+    train_keys = []
+    test_keys = []
+    
+    for key in dataset.valid_samples:
+        subject = dataset.h5['movements'][key].attrs.get('subject_id', "Unknown")
+        if subject in test_subjects:
+            test_keys.append(key)
+        else:
+            train_keys.append(key)
+    
+    print(f"Subject split: {len(train_keys)} training samples, {len(test_keys)} testing samples")
+    print(f"Test subjects: {test_subjects}")
+    return train_keys, test_keys
+
+def create_movement_split(dataset, test_ratio=0.2):
+    """Split dataset by movement_name/exercise_id"""
+    # Get unique movement types
+    movement_types = set()
+    for key in dataset.valid_samples:
+        movement = dataset.h5['movements'][key].attrs.get('exercise_id', "Unknown")
+        movement_types.add(movement)
+    
+    # Randomly select test movements
+    movement_types = list(movement_types)
+    num_test_movements = max(1, int(len(movement_types) * test_ratio))
+    random.shuffle(movement_types)
+    test_movements = movement_types[:num_test_movements]
+    
+    # Create split
+    train_keys = []
+    test_keys = []
+    for key in dataset.valid_samples:
+        movement = dataset.h5['movements'][key].attrs.get('exercise_id', "Unknown")
+        if movement in test_movements:
+            test_keys.append(key)
+        else:
+            train_keys.append(key)
+    
+    print(f"Movement split: {len(train_keys)} training samples, {len(test_keys)} testing samples")
+    print(f"Test movements: {test_movements}")
+    return train_keys, test_keys
+
+def create_cross_validation_splits(dataset, n_folds=5, by='subject_id'):
+    """Create n-fold cross-validation splits by subject, movement, or session"""
+    # Get unique values for the split criterion
+    unique_values = set()
+    for key in dataset.valid_samples:
+        value = dataset.h5['movements'][key].attrs.get(by, "Unknown")
+        unique_values.add(value)
+    
+    # Create folds
+    unique_values = list(unique_values)
+    random.shuffle(unique_values)
+    fold_size = len(unique_values) // n_folds
+    
+    all_splits = []
+    for i in range(n_folds):
+        # Select test values for this fold
+        start_idx = i * fold_size
+        end_idx = start_idx + fold_size if i < n_folds - 1 else len(unique_values)
+        test_values = unique_values[start_idx:end_idx]
+        
+        # Create train/test keys
+        train_keys = []
+        test_keys = []
+        for key in dataset.valid_samples:
+            value = dataset.h5['movements'][key].attrs.get(by, "Unknown")
+            if value in test_values:
+                test_keys.append(key)
+            else:
+                train_keys.append(key)
+        
+        all_splits.append((train_keys, test_keys))
+    
+    return all_splits
+
+
 # === Training Function ===
 def train_model(dataset, epochs=20, batch_size=8, learning_rate=1e-4, weight_decay=1e-5, 
                 use_memory=True, progressive=True, save_path="best_model.pth", device=None):
@@ -508,18 +683,18 @@ def train_model(dataset, epochs=20, batch_size=8, learning_rate=1e-4, weight_dec
     )
     
     # Loss function
-    mse_loss = nn.MSELoss()
+    l1_loss = nn.L1Loss() 
     
     # IDCT matrix for evaluation
     idct_mat = build_idct_matrix(T_PRED).to(device)
     
     # Training loop
     best_loss = float('inf')
-    losses, accs = [], []
+    losses, maes = [], []
     
     for epoch in range(epochs):
         model.train()
-        total_loss, total_acc = 0, 0
+        total_loss, total_mae = 0, 0
         
         with tqdm(loader, desc=f"Epoch {epoch+1}/{epochs}") as progress_bar:
             for obs_batch, fut_batch, _ in progress_bar:
@@ -534,13 +709,9 @@ def train_model(dataset, epochs=20, batch_size=8, learning_rate=1e-4, weight_dec
                     last_frame.repeat(1, T_PRED, 1)
                 ], dim=1)  # (B, T_TOTAL, J)
                 
-                # Apply DCT to input sequence - avoid modifying tensors in-place
-                dct_batch = []
-                for b in range(B):
-                    dct_coeffs = apply_dct_2d(padded_obs[b].cpu().numpy())
-                    dct_batch.append(torch.tensor(dct_coeffs, dtype=torch.float32))
-                
-                input_dct = torch.stack(dct_batch).to(device)  # (B, T_TOTAL, J)
+                # Use batch DCT transform for more efficient processing
+                dct_m = build_dct_matrix(T_TOTAL).to(device)
+                input_dct = batch_dct_transform(padded_obs, dct_m)
                 
                 # Extract baseline DCT (last T_PRED coefficients)
                 baseline_dct = input_dct[:, -T_PRED:, :].clone()  # (B, T_PRED, J)
@@ -556,7 +727,7 @@ def train_model(dataset, epochs=20, batch_size=8, learning_rate=1e-4, weight_dec
                 predicted_dct = pred_residual + baseline_dct  # (B, T_PRED, J)
                 
                 # Apply IDCT to get time domain prediction
-                pred_fut = torch_idct_2d(predicted_dct, idct_mat)  # (B, T_PRED, J)
+                pred_fut = batch_idct_transform(predicted_dct, idct_mat)  # (B, T_PRED, J)
                 
                 # Create mask for thumb joints
                 mask = torch.ones(pred_fut.shape[-1], dtype=torch.bool, device=device)
@@ -567,7 +738,7 @@ def train_model(dataset, epochs=20, batch_size=8, learning_rate=1e-4, weight_dec
                 masked_target = fut_batch[:, :, mask]
                 
                 # Compute loss
-                loss = mse_loss(masked_pred, masked_target)
+                loss = l1_loss(masked_pred, masked_target)
                 
                 # Backpropagation
                 loss.backward()
@@ -578,29 +749,28 @@ def train_model(dataset, epochs=20, batch_size=8, learning_rate=1e-4, weight_dec
                 # Update weights
                 optimizer.step()
                 
-                # Compute accuracy (percent of predictions within 3 degrees)
+                # Compute Mean Absolute Error
                 with torch.no_grad():
-                    diff = (masked_pred - masked_target).abs()
-                    acc = (diff <= 3.0).float().mean().item()
+                    mae = (masked_pred - masked_target).abs().mean().item()
                 
                 # Update statistics
                 total_loss += loss.item()
-                total_acc += acc
+                total_mae += mae
                 
                 # Update progress bar
                 progress_bar.set_postfix({
                     'loss': loss.item(),
-                    'acc': f"{acc*100:.2f}%"
+                    'mae': f"{mae:.4f}"
                 })
         
         # Calculate average metrics
         avg_loss = total_loss / len(loader)
-        avg_acc = total_acc / len(loader)
+        avg_mae = total_mae / len(loader)
         
         losses.append(avg_loss)
-        accs.append(avg_acc)
+        maes.append(avg_mae)
         
-        print(f"Epoch {epoch+1}/{epochs}: Loss={avg_loss:.4f}, Accuracy={avg_acc*100:.2f}%")
+        print(f"Epoch {epoch+1}/{epochs}: Loss={avg_loss:.4f}, MAE={avg_mae:.4f}")
         
         # Update learning rate scheduler
         scheduler.step(avg_loss)
@@ -615,15 +785,15 @@ def train_model(dataset, epochs=20, batch_size=8, learning_rate=1e-4, weight_dec
     plt.figure(figsize=(12, 5))
     plt.subplot(1, 2, 1)
     plt.plot(losses)
-    plt.title("Training Loss")
+    plt.title("Training Loss (L1)")
     plt.xlabel("Epoch")
-    plt.ylabel("MSE Loss")
+    plt.ylabel("L1 Loss")
     
     plt.subplot(1, 2, 2)
-    plt.plot(accs)
-    plt.title("Training Accuracy")
+    plt.plot(maes)
+    plt.title("Mean Absolute Error")
     plt.xlabel("Epoch")
-    plt.ylabel("Accuracy")
+    plt.ylabel("MAE (radians)")
     
     plt.tight_layout()
     plt.savefig("training_curves.png")
@@ -631,120 +801,218 @@ def train_model(dataset, epochs=20, batch_size=8, learning_rate=1e-4, weight_dec
     
     return model
 
-# === Testing Function ===
-def test_model(model, dataset, batch_size=4, device=None):
-    """Improved testing function with visualization."""
+# === Improved Evaluation Function ===
+def evaluate_model(model, dataset, device=None, batch_size=32):
+    """Comprehensive evaluation protocol following Mao et al.
+    
+    Adapted from Mao et al. (2019) "Learning Trajectory Dependencies for Human Motion Prediction"
+    Source: https://github.com/wei-mao-2019/LearnTrajDep/blob/master/evaluate.py
+    
+    Args:
+        model: Trained motion prediction model
+        dataset: Dataset containing test samples
+        device: Device to run evaluation on
+        batch_size: Batch size for evaluation
+        
+    Returns:
+        Dictionary containing evaluation metrics
+    """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # Create DataLoader
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False
-    )
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     
-    # IDCT matrix
-    idct_mat = build_idct_matrix(T_PRED).to(device)
+    # Precompute DCT and IDCT matrices
+    dct_m = build_dct_matrix(T_TOTAL).to(device)
+    idct_m = build_idct_matrix(T_PRED).to(device)
+    
+    # Define specific frames for evaluation (following standard papers)
+    # 80ms, 160ms, 320ms, 400ms, 560ms, 1000ms at 25fps
+    frames_per_second = 25
+    ms_to_frames = lambda ms: int(ms * frames_per_second / 1000)
+    eval_ms = [80, 160, 320, 400, 560, 1000]
+    eval_frames = [ms_to_frames(ms) for ms in eval_ms]
+    
+    # Track metrics by movement/exercise type
+    movement_results = {}
     
     # Switch to evaluation mode
     model.eval()
     
-    total_acc = 0
-    total_samples = 0
-    
     with torch.no_grad():
-        for batch_idx, (obs_batch, fut_batch, metadata) in enumerate(tqdm(loader, desc="Testing")):
+        for batch_idx, (obs_batch, fut_batch, metadata) in enumerate(tqdm(loader, desc="Evaluating")):
             B = obs_batch.size(0)
             obs_batch = obs_batch.to(device)
             fut_batch = fut_batch.to(device)
             
             # Process each sample in the batch
             for i in range(B):
-                obs = obs_batch[i].unsqueeze(0)  # (1, T_OBS, J)
-                fut = fut_batch[i].unsqueeze(0)  # (1, T_PRED, J)
+                # Get movement type for categorization
+                movement_type = str(metadata['exercise_id'][i])  # Convert to string for dictionary key
+                if movement_type not in movement_results:
+                    movement_results[movement_type] = {ms: [] for ms in eval_ms}
+                
+                # Standard prediction process
+                obs = obs_batch[i].unsqueeze(0)
+                fut = fut_batch[i].unsqueeze(0)
                 
                 # Prepare input with padding
                 last_frame = obs[:, -1:, :]
                 padded_obs = torch.cat([obs, last_frame.repeat(1, T_PRED, 1)], dim=1)
                 
-                # Apply DCT
-                dct_coeffs = apply_dct_2d(padded_obs[0].cpu().numpy())
-                input_dct = torch.tensor(dct_coeffs, dtype=torch.float32).unsqueeze(0).to(device)
-                
-                # Extract baseline
-                baseline_dct = input_dct[:, -T_PRED:, :]
+                # Apply batch DCT
+                input_dct = batch_dct_transform(padded_obs, dct_m)
                 
                 # Forward pass
                 predicted_residual = model(input_dct)
-                pred_residual = predicted_residual[:, -T_PRED:, :]
                 
-                # Combine with baseline
+                # Extract future part
+                pred_residual = predicted_residual[:, -T_PRED:, :]
+                baseline_dct = input_dct[:, -T_PRED:, :]
                 predicted_dct = pred_residual + baseline_dct
                 
-                # Apply IDCT
-                pred_fut = torch_idct_2d(predicted_dct, idct_mat)
+                # Convert back to time domain
+                pred_fut = batch_idct_transform(predicted_dct, idct_m)
                 
-                # Compute accuracy
+                # Apply mask for thumb joints if needed
                 mask = torch.ones(pred_fut.shape[-1], dtype=torch.bool, device=device)
                 mask[THUMB_JOINTS] = False
                 
-                masked_pred = pred_fut[:, :, mask]
-                masked_target = fut[:, :, mask]
+                # Calculate error at each evaluation frame
+                for f_idx, frame in enumerate(eval_frames):
+                    if frame < fut.shape[1]:  # Make sure frame exists
+                        # MAE for angle representation
+                        error = (pred_fut[0, frame, mask] - fut[0, frame, mask]).abs().mean().item()
+                        movement_results[movement_type][eval_ms[f_idx]].append(error)
                 
-                diff = (masked_pred - masked_target).abs()
-                acc = (diff < 10.0).float().mean().item()
-                
-                total_acc += acc
-                total_samples += 1
-                
-                # Visualize first few samples
-                if batch_idx < 5 and i == 0:
-                    # Plot full sequence for visualization
-                    pred_np = pred_fut.squeeze(0).cpu().numpy()
-                    target_np = fut.squeeze(0).cpu().numpy()
-                    
-                    # Plot trajectories for selected joints
-                    plt.figure(figsize=(15, 10))
-                    
-                    for j_idx, joint_idx in enumerate([6, 10, 14, 18]):  # Different finger joints
-                        plt.subplot(4, 1, j_idx + 1)
-                        plt.plot(target_np[:, joint_idx], 'g-', label='Ground Truth')
-                        plt.plot(pred_np[:, joint_idx], 'r--', label='Prediction')
-                        plt.title(f"Joint {joint_idx} Trajectory")
-                        plt.legend()
-                    
-                    plt.tight_layout()
-                    plt.savefig(f"joint_predictions_{batch_idx}.png")
-                    plt.close()
-                    
-                    # Also visualize full hand movement at key frames
-                    plt.figure(figsize=(15, 5))
-                    num_frames = 5  # Show 5 frames from the prediction
-                    frame_indices = np.linspace(0, T_PRED-1, num_frames).astype(int)
-                    
-                    for f_idx, frame_idx in enumerate(frame_indices):
-                        plt.subplot(1, num_frames, f_idx + 1)
-                        
-                        # Plot all joints in this frame - in a real implementation
-                        # you would need to convert joint angles to 3D positions
-                        plt.scatter(range(NUM_JOINTS), target_np[frame_idx], c='g', label='Ground Truth')
-                        plt.scatter(range(NUM_JOINTS), pred_np[frame_idx], c='r', marker='x', label='Prediction')
-                        
-                        plt.title(f"Frame {frame_idx}")
-                        if f_idx == 0:
-                            plt.legend()
-                    
-                    plt.suptitle(f"Sample {batch_idx} - {metadata['movement_name'][i]}")
-                    plt.tight_layout()
-                    plt.savefig(f"frame_predictions_{batch_idx}.png")
-                    plt.close()
+                # Visualization (limited to first few samples)
+                if batch_idx < 3 and i == 0:
+                    visualize_predictions(pred_fut[0], fut[0], batch_idx, metadata['movement_name'][i])
     
-    # Calculate overall accuracy
-    final_acc = total_acc / total_samples
-    print(f"✅ Test Accuracy: {final_acc*100:.2f}%")
+    # Calculate average metrics
+    overall_results = {ms: [] for ms in eval_ms}
+    for movement, metrics in movement_results.items():
+        for ms, errors in metrics.items():
+            if errors:
+                avg_error = sum(errors) / len(errors)
+                overall_results[ms].append(avg_error)
     
-    return final_acc
+    # Compute overall averages
+    overall_avg = {ms: sum(errors)/len(errors) if errors else float('nan') for ms, errors in overall_results.items()}
+    
+    # Print results in format similar to papers
+    print("\n----- Evaluation Results (MAE) -----")
+    header = ["Movement"] + [f"{ms}ms" for ms in eval_ms]
+    print("  ".join(f"{h:<12}" for h in header))
+    print("-" * 100)
+    
+    for movement, metrics in movement_results.items():
+        row = [movement[:12]]
+        for ms in eval_ms:
+            if metrics[ms]:
+                row.append(f"{sum(metrics[ms])/len(metrics[ms]):.4f}")
+            else:
+                row.append("N/A")
+        print("  ".join(f"{r:<12}" for r in row))
+    
+    print("-" * 100)
+    row = ["Average"]
+    for ms in eval_ms:
+        if overall_results[ms]:
+            row.append(f"{overall_avg[ms]:.4f}")
+        else:
+            row.append("N/A")
+    print("  ".join(f"{r:<12}" for r in row))
+    
+    # Export results to CSV for paper tables
+    try:
+        import csv
+        with open('evaluation_results.csv', 'w', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(['Movement'] + [f'{ms}ms' for ms in eval_ms])
+            
+            for movement, metrics in movement_results.items():
+                row = [movement]
+                for ms in eval_ms:
+                    if metrics[ms]:
+                        row.append(sum(metrics[ms]) / len(metrics[ms]))
+                    else:
+                        row.append('N/A')
+                writer.writerow(row)
+            
+            # Add average row
+            avg_row = ['Average']
+            for ms in eval_ms:
+                if overall_results[ms]:
+                    avg_row.append(sum(overall_results[ms]) / len(overall_results[ms]))
+                else:
+                    avg_row.append('N/A')
+            writer.writerow(avg_row)
+            
+        print(f"Results exported to evaluation_results.csv")
+    except Exception as e:
+        print(f"Could not export results to CSV: {e}")
+    
+    # Return the computed metrics
+    return {
+        "by_movement": movement_results,
+        "overall": overall_avg
+    }
+
+def visualize_predictions(pred, target, sample_idx, movement_name):
+    """Visualize predictions in a standardized format.
+    
+    Args:
+        pred: Predicted poses tensor
+        target: Ground truth poses tensor
+        sample_idx: Sample index for file naming
+        movement_name: Name of the movement for title
+    """
+    pred_np = pred.cpu().numpy()
+    target_np = target.cpu().numpy()
+    
+    # 1. Plot trajectory of key joints over time
+    plt.figure(figsize=(15, 10))
+    
+    # Select representative joints
+    key_joints = [0, 6, 10, 14, 18]  # Base, and each finger
+    
+    for j_idx, joint_idx in enumerate(key_joints):
+        plt.subplot(len(key_joints), 1, j_idx + 1)
+        plt.plot(target_np[:, joint_idx], 'g-', label='Ground Truth')
+        plt.plot(pred_np[:, joint_idx], 'r--', label='Prediction')
+        plt.title(f"Joint {joint_idx} Trajectory")
+        if j_idx == 0:
+            plt.legend()
+    
+    plt.tight_layout()
+    plt.savefig(f"joint_trajectories_{sample_idx}.png")
+    plt.close()
+    
+    # 2. Plot poses at specific time horizons (80ms, 160ms, 400ms, 1000ms)
+    horizon_frames = [2, 4, 10, 25]  # Convert ms to frames (assuming 25fps)
+    horizon_labels = ["80ms", "160ms", "400ms", "1000ms"]
+    
+    plt.figure(figsize=(16, 6))
+    plt.suptitle(f"Prediction: {movement_name}", fontsize=16)
+    
+    for h_idx, frame_idx in enumerate(horizon_frames):
+        if frame_idx < pred_np.shape[0]:
+            plt.subplot(1, len(horizon_frames), h_idx + 1)
+            
+            # Create scatter plot for each joint position
+            plt.scatter(range(NUM_JOINTS), target_np[frame_idx], c='g', label='Ground Truth')
+            plt.scatter(range(NUM_JOINTS), pred_np[frame_idx], c='r', marker='x', label='Prediction')
+            
+            plt.title(f"t+{horizon_labels[h_idx]}")
+            if h_idx == 0:
+                plt.legend()
+            plt.ylim(-3, 3)  # Standardize y-axis for better comparison
+    
+    plt.tight_layout()
+    plt.savefig(f"horizon_comparison_{sample_idx}.png")
+    plt.close()
 
 def main():
     """Main function to train and test the model."""
@@ -770,6 +1038,16 @@ def main():
     parser.add_argument('--filtered-keys', type=str, default="filtered_keys.pkl", help="Path for saving/loading filtered keys")
     parser.add_argument('--filter-save', action='store_true', help="Filter and save a clean dataset")
     parser.add_argument('--filtered-output', type=str, default="shadow_dataset_filtered.h5", help="Output path for filtered dataset")
+    
+    # New data splitting parameters
+    parser.add_argument('--split-type', choices=['subject', 'movement', 'random'], default='subject',
+                      help="How to split the dataset for train/test (by subject, movement, or random)")
+    parser.add_argument('--test-ratio', type=float, default=0.2, 
+                      help="Percentage of data to use for testing (for random split)")
+    parser.add_argument('--test-subjects', type=str, nargs='+', 
+                      help="Specific subjects to use for testing (for subject split)")
+    parser.add_argument('--cross-val', action='store_true', help="Use cross-validation")
+    parser.add_argument('--n-folds', type=int, default=5, help="Number of folds for cross-validation")
     
     args = parser.parse_args()
     
@@ -813,10 +1091,54 @@ def main():
                 in_grp.copy(key, out_grp)
         print(f"✅ Filtered dataset saved to {args.filtered_output}")
     
+    # Create data splits for train/test
+    train_keys, test_keys = None, None
+    
+    if args.cross_val:
+        # Create cross-validation splits
+        print(f"Creating {args.n_folds}-fold cross-validation splits by {args.split_type}...")
+        cv_splits = create_cross_validation_splits(dataset, n_folds=args.n_folds, by=args.split_type + '_id')
+        # For simplicity, use first fold for now (can be extended to use all folds)
+        train_keys, test_keys = cv_splits[0]
+        print(f"Using fold 1/{args.n_folds} with {len(train_keys)} train samples and {len(test_keys)} test samples")
+    else:
+        # Create a single train/test split
+        if args.split_type == 'subject':
+            train_keys, test_keys = create_subject_split(dataset, test_subjects=args.test_subjects, test_ratio=args.test_ratio)
+        elif args.split_type == 'movement':
+            train_keys, test_keys = create_movement_split(dataset, test_ratio=args.test_ratio)
+        else:  # random split
+            # Implement a simple random split
+            indices = list(range(len(dataset)))
+            random.shuffle(indices)
+            split = int(len(indices) * (1 - args.test_ratio))
+            train_indices = indices[:split]
+            test_indices = indices[split:]
+            train_keys = [dataset.valid_samples[i] for i in train_indices]
+            test_keys = [dataset.valid_samples[i] for i in test_indices]
+            print(f"Random split: {len(train_keys)} training samples, {len(test_keys)} testing samples")
+    
+    # Create train and test datasets
+    train_dataset = MovementDataset(
+        h5_path=args.data,
+        T_obs=T_OBS,
+        T_pred=T_PRED,
+        prefiltered=True,
+        filtered_keys=train_keys
+    )
+    
+    test_dataset = MovementDataset(
+        h5_path=args.data,
+        T_obs=T_OBS,
+        T_pred=T_PRED,
+        prefiltered=True,
+        filtered_keys=test_keys
+    )
+    
     # Train model
     if args.mode in ['train', 'both']:
         model = train_model(
-            dataset=dataset,
+            dataset=train_dataset,  # Use training dataset for training
             epochs=args.epochs,
             batch_size=args.batch_size,
             learning_rate=args.learning_rate,
@@ -827,7 +1149,7 @@ def main():
             device=device
         )
     
-    # Test model
+    # Test model using the improved evaluation function
     if args.mode in ['test', 'both']:
         if args.mode == 'test':
             # Create model and load weights
@@ -837,7 +1159,18 @@ def main():
             ).to(device)
             model.load_state_dict(torch.load(args.model_path, map_location=device))
         
-        test_model(model, dataset, batch_size=args.batch_size, device=device) 
+        # Use the improved evaluation function with test dataset
+        results = evaluate_model(
+            model=model, 
+            dataset=test_dataset,  # Use test dataset for evaluation 
+            device=device, 
+            batch_size=args.batch_size
+        )
+        
+        with open("evaluation_results.json", "w") as f:
+            json.dump(results, f, indent=2)
+        print("Saved evaluation_results.json")
+        
 
 if __name__ == "__main__":
     main()

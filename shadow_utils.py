@@ -1,191 +1,236 @@
-import math
+# shadow_utils.py (Global Anatomical Normalization)
+
 import numpy as np
-import re
-import os
 import sys
+import os
+import scipy.interpolate as interp
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from tools.handAngleData import HandAnglesData
 
-# === Constants ===
+NINAPRO_MAPPING = {
+    'WRIST': {'F': 20, 'A': 21},
+    'FF': {'MCP': 4, 'PIP': 6, 'DIP': 16},
+    'MF': {'MCP': 7, 'PIP': 8, 'DIP': 17},
+    'RF': {'MCP': 9, 'PIP': 11, 'DIP': 18},
+    'LF': {'MCP': 13, 'PIP': 15, 'DIP': 19},
+    'LF_EXTRA': {'CMC': 12}
+}
 
-JOINT_LIMITS = {
+SHADOW_ANGLE_LIMITS = {
     'MCP': (-15, 90),
     'PIP': (0, 90),
-    'DIP': (0, 90),
-    'MCP_A': (-20, 20),
+    'DIP': (0, 90)
 }
 
-NINAPRO_TRUE_RANGES = {
-    'FF': {
-        'DIP': (-10.42, 143.96),
-        'PIP': (-13.68, 107.16),
-        'MCP': (-35.98, 61.70),
-        'MCP_A': (float('nan'), float('nan')),
-    },
-    'MF': {
-        'DIP': (0, 70),
-        'PIP': (0, 65),
-        'MCP': (0, 20),
-        'MCP_A': (-1.75, 2.00),
-    },
-    'RF': {
-        'DIP': (-144.44, -10),
-        'PIP': (-10.24, 117.62),
-        'MCP': (-30.16, 50.04),
-        'MCP_A': (-2.06, 9.91),
-    },
-    'LF': {
-        'DIP': (-57.67, 25.49),
-        'PIP': (-9.66, 111.52),
-        'MCP': (-9.98, 144.66),
-        'MCP_A': (-11.86, -8.57),
-    },
+JOINT_TUNING = {
+    'FF': {'DIP': 1.0, 'PIP': 1.0, 'MCP': 1.0},
+    'MF': {'DIP': 1.0, 'PIP': 1.0, 'MCP': 1.0},
+    'RF': {'DIP': 1.0, 'PIP': 1.0, 'MCP': 1.0},
+    'LF': {'DIP': 1.0, 'PIP': 1.0, 'MCP': 1.0},
 }
 
-NINAPRO_MAPPING = {
-    'FF': {'MCP': 4, 'PIP': 6, 'DIP': 16, 'MCP_A': 5},
-    'MF': {'MCP': 7, 'PIP': 8, 'DIP': 17, 'MCP_A': 10},
-    'RF': {'MCP': 9, 'PIP': 11, 'DIP': 18, 'MCP_A': 12},
-    'LF': {'MCP': 13, 'PIP': 15, 'DIP': 19, 'MCP_A': 14},
-    'WRIST': {'F': 20, 'A': 21},
+SHADOW_REST_BASELINE = {}
+
+ANATOMICAL_MIN_MAX = {
+    finger: {joint: [np.inf, -np.inf] for joint in ['MCP', 'PIP', 'DIP']}
+    for finger in ['FF', 'MF', 'RF', 'LF']
 }
 
-SHADOW_REST = {f: {j: 0.0 for j in JOINT_LIMITS.keys()} for f in ['FF', 'MF', 'RF', 'LF']}
+E2_EXTENSION= set(range(9, 17))
 
-# === Functions ===
+MOVEMENT_NAMES_B = {
+    1: "Thumb up", 2: "Extension of index and middle, flexion of the others",
+    3: "Flexion of ring and little finger, extension of the others",
+    4: "Thumb opposing base of little finger", 5: "Abduction of all fingers",
+    6: "Fingers flexed together into a fist", 7: "Pointing index", 8: "Adduction on extended fingers",
+    9: "Wrist supination (MF axis)", 10: "Wrist supination", 11: "Wrist supination (LF axis)",
+    12: "Wrist pronation (LF axis)", 13: "Wrist flexion", 14: "Wrist extension",
+    15: "Wrist radial deviation", 16: "Wrist ulnar deviation", 17: "Wrist extension with closed hand", 0: "Rest"
+}
 
-def build_dynamic_ranges(data, movement_data):
-    dynamic_ranges = {}
-    for finger in ['FF', 'MF', 'RF', 'LF']:
-        dynamic_ranges[finger] = {}
-        for joint in ['DIP', 'PIP', 'MCP', 'MCP_A']:
-            col = NINAPRO_MAPPING[finger][joint]
-            relevant_vals = data[(movement_data > 0), col]
-            relevant_vals = relevant_vals[~np.isnan(relevant_vals)]
-
-            if len(relevant_vals) > 0:
-                dynamic_min, dynamic_max = np.min(relevant_vals), np.max(relevant_vals)
-                global_min, global_max = NINAPRO_TRUE_RANGES[finger][joint]
-
-                if (finger == 'MF' and joint == 'DIP') or (finger == 'RF' and joint in ['MCP', 'PIP', 'DIP']):
-                    dynamic_ranges[finger][joint] = (global_min, global_max)
-                else:
-                    combined_min = min(global_min, dynamic_min)
-                    combined_max = max(global_max, dynamic_max)
-                    dynamic_ranges[finger][joint] = (combined_min, combined_max)
-            else:
-                dynamic_ranges[finger][joint] = NINAPRO_TRUE_RANGES[finger][joint]
-    return dynamic_ranges
+MOVEMENT_NAMES_C = {
+    1: "Large diameter grasp", 2: "Small diameter grasp", 3: "Fixed hook grasp", 4: "Index finger extension grasp",
+    5: "Medium wrap", 6: "Ring grasp", 7: "Prismatic four fingers grasp", 8: "Stick grasp", 9: "Writing tripod grasp",
+    10: "Power sphere grasp", 11: "Three finger sphere grasp", 12: "Precision sphere grasp", 13: "Tripod grasp",
+    14: "Prismatic pinch grasp", 15: "Tip pinch grasp", 16: "Quadpod grasp", 17: "Lateral grasp",
+    18: "Parallel extension grasp", 19: "Extension type grasp", 20: "Power disk grasp",
+    21: "Open a bottle with a tripod grasp", 22: "Turn a screw", 23: "Cut something", 0: "Rest"
+}
 
 
-def scale_relative_to_shadow(finger, joint, value, current_ranges):
-    raw_min, raw_max = current_ranges[finger][joint]
-    shadow_min, shadow_max = JOINT_LIMITS[joint]
+def set_shadow_rest_baseline(angles, movements, repetitions):
+    global SHADOW_REST_BASELINE
+    idx_movement_11 = np.where(movements == 11)[0]
+    movement_11_reps = np.unique(repetitions[idx_movement_11])
 
-    if raw_max - raw_min < 1e-6:
-        return shadow_min
+    rest_values = {finger: {joint: [] for joint in ['MCP', 'PIP', 'DIP']} for finger in ['FF', 'MF', 'RF', 'LF']}
 
-    value = np.clip(value, raw_min, raw_max)
-    scaled = (value - raw_min) / (raw_max - raw_min)
-    angle = scaled * (shadow_max - shadow_min) + shadow_min
+    for rep in movement_11_reps:
+        rep_mask = repetitions[idx_movement_11].squeeze() == rep
+        rep_indices = idx_movement_11[rep_mask]
 
-    return np.clip(angle, shadow_min, shadow_max)
+        if len(rep_indices) == 0:
+            continue
 
+        start = rep_indices[0]
+        end = rep_indices[-1]
+        center_start = start + (end - start) // 3
+        center_end = end - (end - start) // 3
 
-def apply_dip_constraint(pip, mcp, dip):
-    if math.isnan(dip): dip = 0
-    if not math.isnan(pip) and not math.isnan(mcp):
-        if pip < 30 and mcp < 30:
-            dip = min(dip, pip * 0.66)
-        if pip < 10 and mcp < 10:
-            dip = min(dip, 5)
-    return max(dip, -5)
-
-
-def convert_row_to_shadow_angles(row, movement, current_ranges, filename=None):
-    modified_row = row.copy()
-
-    FULLY_EXTENDED_MOVEMENTS = {4, 5, 8, 9, 10, 11, 12, 13, 14, 15, 16}
-    if filename and re.match(r'^S\d+_E2_A1\.mat$', os.path.basename(filename)) and movement in FULLY_EXTENDED_MOVEMENTS:
-        for finger in ['FF', 'MF', 'RF', 'LF']:
-            for joint in ['DIP', 'PIP', 'MCP', 'MCP_A']:
-                modified_row[NINAPRO_MAPPING[finger][joint]] = 0
-        return HandAnglesData.fromDict({
-            **{f"rh_{finger}J{idx}": 0 for finger in ['FF', 'MF', 'RF', 'LF'] for idx in range(1, 5)},
-            'rh_WRJ1': float(modified_row[NINAPRO_MAPPING['WRIST']['F']]),
-            'rh_WRJ2': float(modified_row[NINAPRO_MAPPING['WRIST']['A']]),
-            'rh_THJ1': 0, 'rh_THJ2': 0, 'rh_THJ3': 0, 'rh_THJ4': 0, 'rh_THJ5': 0,
-            'rh_LFJ5': 0,
-        })
-
-    ALIGNMENT_MOVEMENTS = {1, 2, 3, 5, 7, 8}
-    if filename and re.match(r'^S\d+_E3_A1\.mat$', os.path.basename(filename)) and movement in ALIGNMENT_MOVEMENTS:
-        joint_dict = {
-            'rh_WRJ1': float(modified_row[NINAPRO_MAPPING['WRIST']['F']]),
-            'rh_WRJ2': float(modified_row[NINAPRO_MAPPING['WRIST']['A']]),
-            'rh_THJ1': 0, 'rh_THJ2': 0, 'rh_THJ3': 0, 'rh_THJ4': 0, 'rh_THJ5': 0,
-            'rh_LFJ5': 0,
-        }
-
-        mf_angles = {}
-        for idx, joint in enumerate(['DIP', 'PIP', 'MCP'], 1):
-            value = modified_row[NINAPRO_MAPPING['FF'][joint]]
-            angle = 0.0 if math.isnan(value) else scale_relative_to_shadow('FF', joint, value, current_ranges)
-            mf_angles[idx] = angle
+        center_rows = angles[center_start:center_end]
 
         for finger in ['FF', 'MF', 'RF', 'LF']:
-            joint_dict[f'rh_{finger}J1'] = mf_angles[1]
-            joint_dict[f'rh_{finger}J2'] = mf_angles[2]
-            joint_dict[f'rh_{finger}J3'] = mf_angles[3]
-            joint_dict[f'rh_{finger}J4'] = 0.0
+            for joint in ['MCP', 'PIP', 'DIP']:
+                col_idx = NINAPRO_MAPPING[finger][joint]
+                mean_val = np.mean(center_rows[:, col_idx])
+                rest_values[finger][joint].append(mean_val)
 
-        return HandAnglesData.fromDict(joint_dict)
+    SHADOW_REST_BASELINE = {
+        finger: {joint: np.mean(rest_values[finger][joint]) for joint in rest_values[finger]}
+        for finger in rest_values
+    }
 
-    for finger in ['FF', 'MF', 'RF', 'LF']:
-        mcp_val = modified_row[NINAPRO_MAPPING[finger]['MCP']]
-        pip_val = modified_row[NINAPRO_MAPPING[finger]['PIP']]
-        dip_val = modified_row[NINAPRO_MAPPING[finger]['DIP']]
+    #print("\n✅ Computed SHADOW_REST_BASELINE from Movement 11 center regions:")
+    #for finger in SHADOW_REST_BASELINE:
+       # print(f"  {finger}: {SHADOW_REST_BASELINE[finger]}")
 
-        if not math.isnan(pip_val):
-            if math.isnan(dip_val) or dip_val > pip_val:
-                modified_row[NINAPRO_MAPPING[finger]['DIP']] = pip_val
-            modified_row[NINAPRO_MAPPING[finger]['DIP']] = min(modified_row[NINAPRO_MAPPING[finger]['DIP']], pip_val * 0.6)
+def scan_dataset_for_ranges(angles):
+    global ANATOMICAL_MIN_MAX
+    for row in angles:
+        for finger in ['FF', 'MF', 'RF', 'LF']:
+            for joint in ['MCP', 'PIP', 'DIP']:
+                col_idx = NINAPRO_MAPPING[finger][joint]
+                val = float(row[col_idx])
+                min_val, max_val = ANATOMICAL_MIN_MAX[finger][joint]
+                ANATOMICAL_MIN_MAX[finger][joint][0] = min(min_val, val)
+                ANATOMICAL_MIN_MAX[finger][joint][1] = max(max_val, val)
+    #print("\n✅ Scanned GLOBAL anatomical ranges (absolute):")
+    #for finger in ANATOMICAL_MIN_MAX:
+    #    print(f"{finger}: {ANATOMICAL_MIN_MAX[finger]}")
 
-        if not math.isnan(mcp_val) and mcp_val < 5:
-            if not math.isnan(pip_val) and pip_val > 30:
-                modified_row[NINAPRO_MAPPING[finger]['PIP']] = 30
-            if not math.isnan(dip_val) and dip_val > 20:
-                modified_row[NINAPRO_MAPPING[finger]['DIP']] = 20
+def scale_to_shadow(norm_val, joint):
+    shadow_min, shadow_max = SHADOW_ANGLE_LIMITS[joint]
+    return norm_val * (shadow_max - shadow_min) + shadow_min
 
-        if not math.isnan(dip_val) and dip_val < -5:
-            modified_row[NINAPRO_MAPPING[finger]['DIP']] = -5
+E2_EXTENSION_STANDARD = set(range(9, 17))  # 9–16 (standard E2)
+E2_EXTENSION_OFFSET = set(m + 17 for m in range(9, 17))  # 26–33 (E2 in E1+E2 dirs)
 
+E2_EXTENSION_STANDARD = set(range(9, 17))  # 9–16 (wrist-only movements in Table B)
+
+def convert_row_to_shadow_angles(row, movement_id, rep_id, source_file):
     joint_dict = {
-        'rh_WRJ1': float(modified_row[NINAPRO_MAPPING['WRIST']['F']]),
-        'rh_WRJ2': float(modified_row[NINAPRO_MAPPING['WRIST']['A']]),
-        'rh_THJ1': 0, 'rh_THJ2': 0, 'rh_THJ3': 0, 'rh_THJ4': 0, 'rh_THJ5': 0,
-        'rh_LFJ5': 0,
+        'rh_WRJ1': float(row[NINAPRO_MAPPING['WRIST']['F']]),
+        'rh_WRJ2': float(row[NINAPRO_MAPPING['WRIST']['A']]),
+        'rh_THJ1': 0, 'rh_THJ2': 0, 'rh_THJ3': 0, 'rh_THJ4': 0, 'rh_THJ5': 0
+    }
+
+    # Determine if we are processing a Table B file (E1 or E2 in E2+E3 dirs)
+    is_table_b = False
+
+    if "_E1_" in source_file:
+        is_table_b = True  # E1 is always Table B
+    elif "_E2_" in source_file:
+        source_dir = os.path.dirname(source_file) or '.'
+        mat_files = [f for f in os.listdir(source_dir) if f.endswith(".mat")]
+        has_e3 = any("_E3_" in f for f in mat_files)
+        if has_e3:
+            is_table_b = True  # E2 + E3 dir → Table B in E2, Table C in E3
+        else:
+            is_table_b = False  # E1 + E2 dir → Table B in E1, Table C in E2
+
+    for finger in ['FF', 'MF', 'RF', 'LF']:
+        try:
+            # Table B file + movement in 9–16 (wrist-only movements)
+            if is_table_b and movement_id in E2_EXTENSION_STANDARD:
+                joint_dict[f'rh_{finger}J1'] = SHADOW_REST_BASELINE[finger]['DIP']
+                joint_dict[f'rh_{finger}J2'] = SHADOW_REST_BASELINE[finger]['PIP']
+                joint_dict[f'rh_{finger}J3'] = SHADOW_REST_BASELINE[finger]['MCP']
+                joint_dict[f'rh_{finger}J4'] = 0.0
+                #print(f"🔧 Overriding finger {finger} to baseline for movement {movement_id} (Table B wrist-only)")
+                continue
+
+            if movement_id == 0:
+                joint_dict[f'rh_{finger}J1'] = SHADOW_REST_BASELINE[finger]['DIP']
+                joint_dict[f'rh_{finger}J2'] = SHADOW_REST_BASELINE[finger]['PIP']
+                joint_dict[f'rh_{finger}J3'] = SHADOW_REST_BASELINE[finger]['MCP']
+                joint_dict[f'rh_{finger}J4'] = 0.0
+            else:
+                for joint in ['MCP', 'PIP', 'DIP']:
+                    col_idx = NINAPRO_MAPPING[finger][joint]
+                    raw_val = float(row[col_idx])
+                    if np.isnan(raw_val):
+                        raw_val = 0.0
+                        #print(f"🚨 NaN raw_val detected for {finger} {joint} in {source_file}, movement {movement_id}, rep {rep_id}, col_idx {col_idx}")
+
+
+                    anat_min, anat_max = ANATOMICAL_MIN_MAX[finger][joint]
+                    if np.isinf(anat_min) or np.isinf(anat_max):
+                        print(f"🚨 Invalid anat_min/anat_max for {finger} {joint} in {source_file} "
+                            f"(anat_min: {anat_min}, anat_max: {anat_max}). Replacing with defaults.")
+                        anat_min, anat_max = 0.0, 90.0  # Or whatever default range makes sense
+                    effective_range = anat_max - anat_min if anat_min != anat_max else 10.0
+
+                    norm = (raw_val - anat_min) / effective_range
+                    norm = np.clip(norm, 0, 1)
+
+                    shadow_scaled = scale_to_shadow(norm, joint) * JOINT_TUNING[finger][joint]
+
+                    joint_name = {
+                        'DIP': f'rh_{finger}J1',
+                        'PIP': f'rh_{finger}J2',
+                        'MCP': f'rh_{finger}J3'
+                    }[joint]
+
+                    joint_dict[joint_name] = shadow_scaled
+                    if any(np.isnan(val) for val in joint_dict.values()):
+                       # print(joint_dict.values())
+                        print(f"🚨 NaNs found in final joint_dict for {source_file} | movement {movement_id}, rep {rep_id}")
+
+
+                    #print(f"{finger} | {joint}: raw={raw_val:.2f}, anat_range=({anat_min:.2f}, {anat_max:.2f}), "
+                    #      f"norm={norm:.2f}, scaled={shadow_scaled:.2f}")
+
+                joint_dict[f'rh_{finger}J4'] = 0.0
+
+        except Exception as e:
+            print(f"⚠️ Error mapping finger {finger} in {source_file}: {e}")
+            for idx in range(1, 5):
+                joint_dict[f'rh_{finger}J{idx}'] = 0.0
+
+    joint_dict['rh_LFJ5'] = 0
+    return HandAnglesData.fromDict(joint_dict)
+
+
+
+def get_baseline_hand_data():
+    joint_dict = {
+        'rh_WRJ1': 0,
+        'rh_WRJ2': 0,
+        'rh_THJ1': 0, 'rh_THJ2': 0, 'rh_THJ3': 0, 'rh_THJ4': 0, 'rh_THJ5': 0
     }
 
     for finger in ['FF', 'MF', 'RF', 'LF']:
-        mcp_val = modified_row[NINAPRO_MAPPING[finger]['MCP']]
-        pip_val = modified_row[NINAPRO_MAPPING[finger]['PIP']]
-        dip_val = modified_row[NINAPRO_MAPPING[finger]['DIP']]
+        joint_dict[f'rh_{finger}J1'] = SHADOW_REST_BASELINE[finger]['DIP']
+        joint_dict[f'rh_{finger}J2'] = SHADOW_REST_BASELINE[finger]['PIP']
+        joint_dict[f'rh_{finger}J3'] = SHADOW_REST_BASELINE[finger]['MCP']
+        joint_dict[f'rh_{finger}J4'] = 0.0
 
-        if mcp_val > 75 and finger == 'MF':
-            if pip_val < 60:
-                pip_val = 60
-            if dip_val < 45:
-                dip_val = 45
-            modified_row[NINAPRO_MAPPING[finger]['PIP']] = pip_val
-            modified_row[NINAPRO_MAPPING[finger]['DIP']] = dip_val
-
-        dip_val = apply_dip_constraint(pip_val, mcp_val, dip_val)
-        modified_row[NINAPRO_MAPPING[finger]['DIP']] = dip_val
-
-        for idx, joint in enumerate(['DIP', 'PIP', 'MCP', 'MCP_A'], 1):
-            raw_val = modified_row[NINAPRO_MAPPING[finger][joint]]
-            scaled = 0.0 if math.isnan(raw_val) else scale_relative_to_shadow(finger, joint, raw_val, current_ranges)
-            joint_dict[f'rh_{finger}J{idx}'] = 0.0 if joint == 'MCP_A' else scaled
-
+    joint_dict['rh_LFJ5'] = 0.0
     return HandAnglesData.fromDict(joint_dict)
+
+
+def resample_sequence(sequence, target_frames=130):
+    """
+    Resample a 2D numpy array (frames x features) to target_frames using interpolation.
+    """
+    num_frames, num_features = sequence.shape
+    if num_frames == target_frames:
+        return sequence  # already correct length
+    x_old = np.linspace(0, 1, num_frames)
+    x_new = np.linspace(0, 1, target_frames)
+    resampled = np.zeros((target_frames, num_features))
+    for f in range(num_features):
+        interpolator = interp.interp1d(x_old, sequence[:, f], kind='linear')
+        resampled[:, f] = interpolator(x_new)
+    return resampled

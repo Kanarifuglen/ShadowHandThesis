@@ -5,20 +5,19 @@ from shadow_utils import (
     scan_dataset_for_ranges,
     convert_row_to_shadow_angles,
     set_shadow_rest_baseline,
-    downsample_indices,
+    resample_sequence,
     MOVEMENT_NAMES_B,
     MOVEMENT_NAMES_C
 )
 
-def generate_shadow_dataset(mat_filename, output_filename="shadow_dataset.npz"):
+def generate_shadow_dataset(mat_filename, output_filename="shadow_dataset.npz", target_frames=130):
     mat_dir = os.path.dirname(mat_filename) or '.'
     mat_files = [f for f in os.listdir(mat_dir) if f.endswith(".mat")]
-
     has_e1 = any("_E1_" in f for f in mat_files)
     has_e2 = any("_E2_" in f for f in mat_files)
     has_e3 = any("_E3_" in f for f in mat_files)
 
-    # 🔄 Choose baseline file smartly
+    # 🔄 Select baseline file
     if has_e1 and has_e2:
         baseline_file = next((f for f in mat_files if "_E1_" in f), None)
     elif has_e2:
@@ -41,7 +40,7 @@ def generate_shadow_dataset(mat_filename, output_filename="shadow_dataset.npz"):
 
     set_shadow_rest_baseline(angles, movements, repetitions)
 
-    # 🔍 Load the actual file to process
+    # 🔍 Load target data
     mat_data = sio.loadmat(mat_filename)
     if 'angles' not in mat_data or 'restimulus' not in mat_data:
         raise ValueError("Missing 'angles' or 'restimulus' in .mat file.")
@@ -56,7 +55,7 @@ def generate_shadow_dataset(mat_filename, output_filename="shadow_dataset.npz"):
 
     scan_dataset_for_ranges(data)
 
-    # Metadata holders
+    # Metadata
     sequences = []
     movement_ids = []
     movement_names = []
@@ -64,7 +63,6 @@ def generate_shadow_dataset(mat_filename, output_filename="shadow_dataset.npz"):
     exercise_tables = []
     exercise_ids = []
     session_ids = []
-    valid_lengths = []
 
     joint_names = [
         'rh_WRJ1', 'rh_WRJ2',
@@ -72,21 +70,12 @@ def generate_shadow_dataset(mat_filename, output_filename="shadow_dataset.npz"):
         'rh_LFJ5'
     ] + [f'rh_{finger}J{idx}' for finger in ['FF', 'MF', 'RF', 'LF'] for idx in range(1, 5)]
 
-    # Skip logic: determine if current file is Table B
     skip_movements_b = {4, 5, 8}
-    is_table_b = False
+    is_table_b = "_E1_" in mat_filename or ("_E2_" in mat_filename and has_e3)
 
-    if "_E1_" in mat_filename:
-        is_table_b = True  # E1 always Table B
-    elif "_E2_" in mat_filename and has_e3:
-        is_table_b = True  # E2 + E3 dir → E2 is Table B
-    else:
-        is_table_b = False  # E2 in E1+E2 dir → Table C
-
-    # Extract session + subject metadata
-    session_id = os.path.splitext(os.path.basename(mat_filename))[0]  # e.g., S1_E2_A1
-    subject_id = session_id.split("_")[0]  # e.g., S1
-    exercise_id = session_id.split("_")[1]  # e.g., E2
+    session_id = os.path.splitext(os.path.basename(mat_filename))[0]
+    subject_id = session_id.split("_")[0]
+    exercise_id = session_id.split("_")[1]
     exercise_table = 'B' if is_table_b else 'C'
 
     j = 0
@@ -106,13 +95,16 @@ def generate_shadow_dataset(mat_filename, output_filename="shadow_dataset.npz"):
         if is_table_b and movement in skip_movements_b:
             continue
 
-        # Downsample this repetition
-        num_frames = end - start
-        indices = downsample_indices(num_frames, target_frames=300)
+        raw_segment = data[start:end, :]
+        if raw_segment.shape[0] <= 10:
+            print(f"⚠️ Skipping movement {movement} rep {rep}: too few frames ({raw_segment.shape[0]})")
+            continue
+
+        print(f"➡️ Resampling movement {movement}, rep {rep} from {end-start} → {target_frames} frames...")
+        resampled_segment = resample_sequence(raw_segment, target_frames)
 
         seq = []
-        for idx in indices:
-            row = data[start + idx, :]
+        for row_idx, row in enumerate(resampled_segment):
             hand_data = convert_row_to_shadow_angles(row, movement, rep, mat_filename)
             seq.append([getattr(hand_data, joint) for joint in joint_names])
 
@@ -120,31 +112,24 @@ def generate_shadow_dataset(mat_filename, output_filename="shadow_dataset.npz"):
         sequences.append(seq_array)
         movement_ids.append(movement)
 
-        if exercise_table == 'B':
-            movement_name = MOVEMENT_NAMES_B.get(movement, "Unknown")
-        else:
-            movement_name = MOVEMENT_NAMES_C.get(movement, "Unknown")
-
+        movement_name = MOVEMENT_NAMES_B.get(movement, "Unknown") if exercise_table == 'B' else MOVEMENT_NAMES_C.get(movement, "Unknown")
         movement_names.append(movement_name)
         subject_ids.append(subject_id)
         exercise_tables.append(exercise_table)
         exercise_ids.append(exercise_id)
         session_ids.append(session_id)
-        valid_lengths.append(seq_array.shape[0])
 
-    # Pad sequences to the same length for transformer readiness
-    max_len = max(valid_lengths) if sequences else 0
-    num_joints = sequences[0].shape[1] if sequences else 0
+    if not sequences:
+        raise ValueError("No valid sequences found!")
 
-    padded_sequences = np.zeros((len(sequences), max_len, num_joints), dtype=np.float32)
-    for i, seq in enumerate(sequences):
-        padded_sequences[i, :seq.shape[0], :] = seq
+    # ✅ stack sequences → all same length
+    final_sequences = np.stack(sequences)
 
-    # Save as .npz
+    # save
     np.savez_compressed(
         output_filename,
-        sequences=padded_sequences,
-        valid_lengths=np.array(valid_lengths),
+        sequences=final_sequences,
+        valid_lengths=np.full((len(sequences),), target_frames, dtype=int),
         movement_ids=np.array(movement_ids),
         movement_names=np.array(movement_names),
         subject_ids=np.array(subject_ids),
@@ -153,4 +138,5 @@ def generate_shadow_dataset(mat_filename, output_filename="shadow_dataset.npz"):
         session_ids=np.array(session_ids)
     )
 
-    print(f"✅ Dataset saved: {output_filename} | Total sequences: {len(sequences)} (max length: {max_len})")
+    print(f"✅ Dataset saved: {output_filename} | Total sequences: {len(sequences)} | Fixed length: {target_frames}")
+
