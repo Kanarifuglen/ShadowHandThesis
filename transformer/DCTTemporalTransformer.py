@@ -9,9 +9,21 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-from scipy.fftpack import dct, idct
+#from scipy.fftpack import dct, idct
 import json
 import random 
+import csv
+import argparse
+import pickle
+from evaluation_utils import (  # Add this import
+    plot_per_joint_error,
+    plot_error_progression_by_frame,
+    plot_action_comparison,
+    generate_detailed_error_table,
+    generate_joint_group_table,
+    analyze_dct_coefficients,
+    visualize_predictions
+)
 
 # === Config ===
 T_OBS = 30  # Number of observed frames
@@ -639,7 +651,7 @@ def create_cross_validation_splits(dataset, n_folds=5, by='subject_id'):
 
 # === Training Function ===
 def train_model(dataset, epochs=20, batch_size=8, learning_rate=1e-4, weight_decay=1e-5, 
-                use_memory=True, progressive=True, save_path="best_model.pth", device=None):
+                use_memory=True, progressive=True, save_path="../models/best_model.pth", device=None):
     """Improved training function with better hyperparameters and monitoring."""
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -796,12 +808,11 @@ def train_model(dataset, epochs=20, batch_size=8, learning_rate=1e-4, weight_dec
     plt.ylabel("MAE (radians)")
     
     plt.tight_layout()
-    plt.savefig("training_curves.png")
-    print("📊 Saved training curves to 'training_curves.png'")
-    
+    plt.savefig("../plots/training_curves.png")
+    print("📊 Saved training curves to '../plots/training_curves.png'")
+
     return model
 
-# === Improved Evaluation Function ===
 def evaluate_model(model, dataset, device=None, batch_size=32):
     """Comprehensive evaluation protocol following Mao et al.
     
@@ -836,6 +847,24 @@ def evaluate_model(model, dataset, device=None, batch_size=32):
     
     # Track metrics by movement/exercise type
     movement_results = {}
+    
+    # For additional analysis
+    all_preds = []
+    all_targets = []
+    all_metadata = []
+    sample_input_dct = None
+    sample_baseline_dct = None
+    sample_pred_residual = None
+    
+    # Define joint names (adjust according to your model)
+    joint_names = [
+        'Root_1', 'Root_2',
+        'Thumb_1', 'Thumb_2', 'Thumb_3', 'Thumb_4', 'Thumb_5',
+        'Index_1', 'Index_2', 'Index_3', 'Index_4',
+        'Middle_1', 'Middle_2', 'Middle_3', 'Middle_4',
+        'Ring_1', 'Ring_2', 'Ring_3', 'Ring_4', 'Ring_5',
+        'Pinky_1', 'Pinky_2', 'Pinky_3', 'Pinky_4'
+    ]
     
     # Switch to evaluation mode
     model.eval()
@@ -878,6 +907,18 @@ def evaluate_model(model, dataset, device=None, batch_size=32):
                 # Apply mask for thumb joints if needed
                 mask = torch.ones(pred_fut.shape[-1], dtype=torch.bool, device=device)
                 mask[THUMB_JOINTS] = False
+                
+                # Save sample for additional analysis (first batch)
+                if batch_idx == 0 and i == 0:
+                    sample_input_dct = input_dct.clone().cpu()
+                    sample_baseline_dct = baseline_dct.clone().cpu()
+                    sample_pred_residual = pred_residual.clone().cpu()
+                
+                # Store predictions and targets for additional analysis
+                if len(all_preds) < 10:  # Limit to 10 samples for memory efficiency
+                    all_preds.append(pred_fut.clone().cpu())
+                    all_targets.append(fut.clone().cpu())
+                    all_metadata.append({k: v[i] for k, v in metadata.items()})
                 
                 # Calculate error at each evaluation frame
                 for f_idx, frame in enumerate(eval_frames):
@@ -927,8 +968,8 @@ def evaluate_model(model, dataset, device=None, batch_size=32):
     
     # Export results to CSV for paper tables
     try:
-        import csv
-        with open('evaluation_results.csv', 'w', newline='') as csvfile:
+        os.makedirs("../evaluations", exist_ok=True)
+        with open('../evaluations/evaluation_results.csv', 'w', newline='') as csvfile:
             writer = csv.writer(csvfile)
             writer.writerow(['Movement'] + [f'{ms}ms' for ms in eval_ms])
             
@@ -950,9 +991,79 @@ def evaluate_model(model, dataset, device=None, batch_size=32):
                     avg_row.append('N/A')
             writer.writerow(avg_row)
             
-        print(f"Results exported to evaluation_results.csv")
+        print(f"Results exported to ../evaluations/evaluation_results.csv")
     except Exception as e:
         print(f"Could not export results to CSV: {e}")
+    
+    # Additional analysis and visualizations
+    print("\n----- Generating Additional Analysis -----")
+    
+    # Create directories for output
+    os.makedirs("../plots", exist_ok=True)
+    
+    # Only proceed with additional analysis if we have data
+    if all_preds and all_targets:
+        try:
+            # 1. Per-Joint Error Analysis
+            try:
+                from evaluation_utils import plot_per_joint_error
+                # Stack first few predictions and targets
+                stacked_preds = torch.cat(all_preds[:5], dim=0)
+                stacked_targets = torch.cat(all_targets[:5], dim=0)
+                # Create mask on CPU
+                cpu_mask = torch.ones(stacked_preds.shape[-1], dtype=torch.bool)
+                cpu_mask[THUMB_JOINTS] = False
+                
+                plot_per_joint_error(stacked_preds, stacked_targets, cpu_mask, joint_names)
+                print("✅ Generated per-joint error analysis")
+            except Exception as e:
+                print(f"Could not generate per-joint error analysis: {e}")
+                
+            # 2. Error Progression Analysis
+            try:
+                from evaluation_utils import plot_error_progression_by_frame
+                plot_error_progression_by_frame(stacked_preds, stacked_targets, cpu_mask)
+                print("✅ Generated error progression analysis")
+            except Exception as e:
+                print(f"Could not generate error progression analysis: {e}")
+            
+            # 3. Action Comparison Visualization
+            try:
+                from evaluation_utils import plot_action_comparison
+                plot_action_comparison(movement_results, eval_ms)
+                print("✅ Generated action comparison visualization")
+            except Exception as e:
+                print(f"Could not generate action comparison: {e}")
+            
+            # 4. Detailed Error Table
+            try:
+                from evaluation_utils import generate_detailed_error_table
+                generate_detailed_error_table(movement_results, eval_ms)
+                print("✅ Generated detailed error table")
+            except Exception as e:
+                print(f"Could not generate detailed error table: {e}")
+            
+            # 5. Joint Group Analysis
+            try:
+                from evaluation_utils import generate_joint_group_table
+                generate_joint_group_table(stacked_preds, stacked_targets, joint_names)
+                print("✅ Generated joint group analysis")
+            except Exception as e:
+                print(f"Could not generate joint group analysis: {e}")
+            
+            # 6. DCT Coefficient Analysis
+            if sample_input_dct is not None and sample_baseline_dct is not None and sample_pred_residual is not None:
+                try:
+                    from evaluation_utils import analyze_dct_coefficients
+                    analyze_dct_coefficients(sample_input_dct, sample_baseline_dct, sample_pred_residual)
+                    print("✅ Generated DCT coefficient analysis")
+                except Exception as e:
+                    print(f"Could not generate DCT coefficient analysis: {e}")
+        
+        except Exception as e:
+            print(f"Error during additional analysis: {e}")
+    else:
+        print("⚠️ No samples available for additional analysis")
     
     # Return the computed metrics
     return {
@@ -960,68 +1071,12 @@ def evaluate_model(model, dataset, device=None, batch_size=32):
         "overall": overall_avg
     }
 
-def visualize_predictions(pred, target, sample_idx, movement_name):
-    """Visualize predictions in a standardized format.
-    
-    Args:
-        pred: Predicted poses tensor
-        target: Ground truth poses tensor
-        sample_idx: Sample index for file naming
-        movement_name: Name of the movement for title
-    """
-    pred_np = pred.cpu().numpy()
-    target_np = target.cpu().numpy()
-    
-    # 1. Plot trajectory of key joints over time
-    plt.figure(figsize=(15, 10))
-    
-    # Select representative joints
-    key_joints = [0, 6, 10, 14, 18]  # Base, and each finger
-    
-    for j_idx, joint_idx in enumerate(key_joints):
-        plt.subplot(len(key_joints), 1, j_idx + 1)
-        plt.plot(target_np[:, joint_idx], 'g-', label='Ground Truth')
-        plt.plot(pred_np[:, joint_idx], 'r--', label='Prediction')
-        plt.title(f"Joint {joint_idx} Trajectory")
-        if j_idx == 0:
-            plt.legend()
-    
-    plt.tight_layout()
-    plt.savefig(f"joint_trajectories_{sample_idx}.png")
-    plt.close()
-    
-    # 2. Plot poses at specific time horizons (80ms, 160ms, 400ms, 1000ms)
-    horizon_frames = [2, 4, 10, 25]  # Convert ms to frames (assuming 25fps)
-    horizon_labels = ["80ms", "160ms", "400ms", "1000ms"]
-    
-    plt.figure(figsize=(16, 6))
-    plt.suptitle(f"Prediction: {movement_name}", fontsize=16)
-    
-    for h_idx, frame_idx in enumerate(horizon_frames):
-        if frame_idx < pred_np.shape[0]:
-            plt.subplot(1, len(horizon_frames), h_idx + 1)
-            
-            # Create scatter plot for each joint position
-            plt.scatter(range(NUM_JOINTS), target_np[frame_idx], c='g', label='Ground Truth')
-            plt.scatter(range(NUM_JOINTS), pred_np[frame_idx], c='r', marker='x', label='Prediction')
-            
-            plt.title(f"t+{horizon_labels[h_idx]}")
-            if h_idx == 0:
-                plt.legend()
-            plt.ylim(-3, 3)  # Standardize y-axis for better comparison
-    
-    plt.tight_layout()
-    plt.savefig(f"horizon_comparison_{sample_idx}.png")
-    plt.close()
+
 
 def main():
     """Main function to train and test the model."""
-    import argparse
-    import pickle
-    import os
-    
     parser = argparse.ArgumentParser(description="Train and test the hand motion prediction model")
-    parser.add_argument('--data', type=str, default="shadow_dataset_filtered.h5", help="Path to the dataset")
+    parser.add_argument('--data', type=str, default="../datasets/shadow_dataset.h5", help="Path to the dataset")
     parser.add_argument('--mode', choices=['train', 'test', 'both'], default='both', help="Operation mode")
     parser.add_argument('--epochs', type=int, default=20, help="Number of training epochs")
     parser.add_argument('--batch-size', type=int, default=8, help="Batch size")
@@ -1030,15 +1085,15 @@ def main():
     parser.add_argument('--subset-size', type=int, default=None, help="Use a subset of data for debugging")
     parser.add_argument('--no-memory', action='store_true', help="Disable memory dictionary")
     parser.add_argument('--no-progressive', action='store_true', help="Disable progressive decoding")
-    parser.add_argument('--model-path', type=str, default="best_model.pth", help="Path for saving/loading model")
+    parser.add_argument('--model-path', type=str, default="../models/best_model.pth", help="Path for saving/loading model")
     
     # Dataset filtering options
     parser.add_argument('--save-dataset', action='store_true', help="Save filtered HDF5 movement keys")
     parser.add_argument('--load-dataset', action='store_true', help="Load filtered HDF5 movement keys")
     parser.add_argument('--filtered-keys', type=str, default="filtered_keys.pkl", help="Path for saving/loading filtered keys")
     parser.add_argument('--filter-save', action='store_true', help="Filter and save a clean dataset")
-    parser.add_argument('--filtered-output', type=str, default="shadow_dataset_filtered.h5", help="Output path for filtered dataset")
-    
+    parser.add_argument('--filtered-output', type=str, default="../datasets/shadow_dataset_filtered.h5", 
+                   help="Output path for filtered dataset")
     # New data splitting parameters
     parser.add_argument('--split-type', choices=['subject', 'movement', 'random'], default='subject',
                       help="How to split the dataset for train/test (by subject, movement, or random)")
@@ -1167,9 +1222,9 @@ def main():
             batch_size=args.batch_size
         )
         
-        with open("evaluation_results.json", "w") as f:
+        with open("../evaluations/evaluation_results.json", "w") as f:
             json.dump(results, f, indent=2)
-        print("Saved evaluation_results.json")
+        print("Saved ../evaluations/evaluation_results.json")
         
 
 if __name__ == "__main__":

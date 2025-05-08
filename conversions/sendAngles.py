@@ -29,14 +29,27 @@ def debug_print_joint_data(hand_data, frame_number, movement=None, repetition=No
 
 
 def send_from_mat(mat_filename, udp_socket, target_frames=130):
-    mat_dir = os.path.dirname(mat_filename) or '.'
-    subject_prefix = mat_filename.split('_')[0]
-    mat_files = [f for f in os.listdir(mat_dir) if f.endswith(".mat") and f.startswith(subject_prefix)]
-
+    # Parse subject ID from filename
+    subject_id = mat_filename.split("_")[0]
+    
+    # Construct path to the subject's directory
+    datasets_base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../datasets/kinematics_dataset'))
+    subject_dir = f"s_{subject_id.lstrip('S').lower()}_angles"  # Convert S1 to s_1_angles format
+    subject_path = os.path.join(datasets_base_dir, subject_dir)
+    
+    if not os.path.exists(subject_path):
+        raise FileNotFoundError(f"Subject directory not found: {subject_path}")
+    
+    # Look for mat files in the subject directory
+    mat_dir = subject_path
+    mat_files = [f for f in os.listdir(mat_dir) if f.endswith(".mat")]
+    
+    # Check for baseline files with the correct subject prefix
     has_e1 = any("_E1_" in f for f in mat_files)
     has_e2 = any("_E2_" in f for f in mat_files)
     has_e3 = any("_E3_" in f for f in mat_files)
 
+    # Select baseline file
     if has_e1 and has_e2:
         baseline_file = next((f for f in mat_files if "_E1_" in f), None)
         baseline_desc = "E1"
@@ -49,6 +62,12 @@ def send_from_mat(mat_filename, udp_socket, target_frames=130):
     baseline_path = os.path.join(mat_dir, baseline_file)
     print(f"🔄 Computing baseline from: {baseline_desc} ({baseline_path})")
 
+    # Get the full path to the target mat file
+    target_mat_path = os.path.join(mat_dir, mat_filename)
+    if not os.path.exists(target_mat_path):
+        raise FileNotFoundError(f"Target file not found: {target_mat_path}")
+    
+    # Load baseline data
     e_data = sio.loadmat(baseline_path)
     if 'angles' not in e_data or 'restimulus' not in e_data:
         raise ValueError(f"Baseline file {baseline_path} missing 'angles' or 'restimulus'")
@@ -63,12 +82,14 @@ def send_from_mat(mat_filename, udp_socket, target_frames=130):
 
     set_shadow_rest_baseline(e_angles, e_movements, e_repetitions)
 
-    # === load main data ===
-    mat_data = sio.loadmat(mat_filename)
+    # === load main data === (use target_mat_path instead of mat_filename)
+    mat_data = sio.loadmat(target_mat_path)
     if 'angles' not in mat_data or 'restimulus' not in mat_data:
         print(".mat file missing 'angles' or 'restimulus'")
         return
 
+    # The rest of the function remains the same, but use target_mat_path 
+    # instead of mat_filename when referenced
     data = mat_data['angles']
     movement_data = mat_data['restimulus'].flatten()
     repetition = mat_data.get('re_repetition') or mat_data.get('repetition')
@@ -99,8 +120,8 @@ def send_from_mat(mat_filename, udp_socket, target_frames=130):
             i += 1
             continue
 
-        # skip logic
-        is_table_b = "_E1_" in mat_filename or ("_E2_" in mat_filename and has_e3)
+        # skip logic (update reference to target_mat_path)
+        is_table_b = "_E1_" in target_mat_path or ("_E2_" in target_mat_path and has_e3)
         if is_table_b and movement in skip_movements_b:
             print(f"⏭️ Skipping movement {movement} (Table B skip)")
             while i < len(movement_data) and movement_data[i] == movement:

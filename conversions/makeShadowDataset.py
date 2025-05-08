@@ -11,13 +11,27 @@ from shadow_utils import (
 )
 
 def generate_shadow_dataset(mat_filename, output_filename="shadow_dataset.npz", target_frames=130):
-    mat_dir = os.path.dirname(mat_filename) or '.'
+    # Parse subject ID from filename
+    subject_id = mat_filename.split("_")[0]
+    
+    # Construct path to the subject's directory
+    datasets_base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../datasets/kinematics_dataset'))
+    subject_dir = f"s_{subject_id.lstrip('S').lower()}_angles"  # Convert S1 to s_1_angles format
+    subject_path = os.path.join(datasets_base_dir, subject_dir)
+    
+    if not os.path.exists(subject_path):
+        raise FileNotFoundError(f"Subject directory not found: {subject_path}")
+    
+    # Look for mat files in the subject directory
+    mat_dir = subject_path
     mat_files = [f for f in os.listdir(mat_dir) if f.endswith(".mat")]
+    
+    # Check for baseline files
     has_e1 = any("_E1_" in f for f in mat_files)
     has_e2 = any("_E2_" in f for f in mat_files)
     has_e3 = any("_E3_" in f for f in mat_files)
 
-    # 🔄 Select baseline file
+    # Select baseline file
     if has_e1 and has_e2:
         baseline_file = next((f for f in mat_files if "_E1_" in f), None)
     elif has_e2:
@@ -26,6 +40,13 @@ def generate_shadow_dataset(mat_filename, output_filename="shadow_dataset.npz", 
         raise FileNotFoundError(f"No E1 or E2 file found in {mat_dir} to compute baseline!")
 
     baseline_path = os.path.join(mat_dir, baseline_file)
+    
+    # Get the full path to the target mat file
+    target_mat_path = os.path.join(mat_dir, mat_filename)
+    if not os.path.exists(target_mat_path):
+        raise FileNotFoundError(f"Target file not found: {target_mat_path}")
+    
+    # Load baseline data
     baseline_data = sio.loadmat(baseline_path)
     if 'angles' not in baseline_data or 'restimulus' not in baseline_data:
         raise ValueError(f"Baseline file {baseline_path} missing 'angles' or 'restimulus'")
@@ -40,8 +61,7 @@ def generate_shadow_dataset(mat_filename, output_filename="shadow_dataset.npz", 
 
     set_shadow_rest_baseline(angles, movements, repetitions)
 
-    # 🔍 Load target data
-    mat_data = sio.loadmat(mat_filename)
+    mat_data = sio.loadmat(target_mat_path)
     if 'angles' not in mat_data or 'restimulus' not in mat_data:
         raise ValueError("Missing 'angles' or 'restimulus' in .mat file.")
 
@@ -124,6 +144,9 @@ def generate_shadow_dataset(mat_filename, output_filename="shadow_dataset.npz", 
 
     # ✅ stack sequences → all same length
     final_sequences = np.stack(sequences)
+    datasets_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../datasets'))
+    os.makedirs(datasets_dir, exist_ok=True)
+    output_filename = os.path.join(datasets_dir, os.path.basename(output_filename))
 
     # save
     np.savez_compressed(

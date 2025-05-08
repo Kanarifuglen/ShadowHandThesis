@@ -12,9 +12,13 @@ from shadow_utils import (
 
 def export_full_dataset_to_hdf5(num_threads=4, target_frames=130):
     """Parses through every subject directory, processes them in parallel threads, and merges into one dataset."""
-    DATA_DIR = r"C:\Master\ShadowHandMotionPrediction-1\kinematics_dataset"
-    output_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shadow_dataset.h5")
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    DATA_DIR = r"C:\Master\ShadowHandThesis\datasets\kinematics_dataset"
+    output_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../datasets'))
+    os.makedirs(output_dir, exist_ok=True)
+
+    output_path = os.path.join(output_dir, "shadow_dataset.h5")
+    tmp_paths = [os.path.join(output_dir, f"tmp_thread_{i}.h5") for i in range(num_threads)]
+
 
     # Find all subject directories
     subject_dirs = [os.path.join(DATA_DIR, d) for d in os.listdir(DATA_DIR)

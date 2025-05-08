@@ -15,6 +15,9 @@ from shadow_utils import (
 def fill_dataset_worker(thread_id, subject_dirs, joint_names, output_path, movement_name_maps, target_frames):
     """Thread job: process all .mat files in its assigned directories."""
     movement_instance_counts = defaultdict(int)
+    datasets_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../datasets'))
+    os.makedirs(datasets_dir, exist_ok=True)
+    output_path = os.path.join(datasets_dir, os.path.basename(output_path))
 
     with h5py.File(output_path, "w") as h5f:
         root_grp = h5f.create_group("movements")
