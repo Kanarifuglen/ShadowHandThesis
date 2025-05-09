@@ -1,3 +1,12 @@
+"""
+This script was developed as part of the Rokoko to Robot pipeline by
+Charlotte Andreff and Loïc Blanc, SINLAB, University of Oslo (2024).
+Repository: https://github.com/sinlab-uio/rokoko-to-robots
+
+For details, see the documentation in 'Rokoko_to_robot_documentation.pdf'.
+"""
+
+
 import socket
 import threading
 import time
@@ -10,8 +19,7 @@ import json
 import pyrr.quaternion as pyq
 import math
 
-# Hvis du vil kjøre denne så må du bytte i rokoko.
-# Constants for the socket between rokoko and the converter
+# Constants for the socket between rokoko and the converter (Set to localhost if working with simulator)
 IP_SERVER = "172.18.130.99"
 PORT_SERVER = 12121
 BUFFER_SIZE = 16384

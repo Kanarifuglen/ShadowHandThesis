@@ -1,3 +1,12 @@
+"""
+This script was developed as part of the Rokoko to Robot pipeline by
+Charlotte Andreff and Loïc Blanc, SINLAB, University of Oslo (2024).
+Repository: https://github.com/sinlab-uio/rokoko-to-robots
+
+For details, see the documentation in 'Rokoko_to_robot_documentation.pdf'.
+"""
+
+
 import numpy as np
 import matplotlib.pyplot as plt
 import rospy

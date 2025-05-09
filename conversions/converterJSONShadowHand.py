@@ -1,3 +1,9 @@
+"""
+This script is based on and inspired by 'converterRokokoShadowHand.py',
+developed by Charlotte Andreff and Loïc Blanc, SINLAB, University of Oslo (2024).
+Repository: https://github.com/sinlab-uio/rokoko-to-robots
+"""
+
 import socket
 import time
 import os
