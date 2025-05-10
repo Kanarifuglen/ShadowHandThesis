@@ -145,7 +145,80 @@ class MovementDataset(Dataset):
         return obs, fut, metadata
     
 
-
+class CombinedDataset(Dataset):
+    """Dataset for combining multiple movement datasets with balanced sampling."""
+    
+    def __init__(self, datasets, dataset_names=None):
+        """Initialize the combined dataset.
+        
+        Args:
+            datasets: List of MovementDataset objects to combine
+            dataset_names: Optional list of names for each dataset
+        """
+        super().__init__()
+        self.datasets = datasets
+        self.dataset_names = dataset_names or [f"dataset_{i}" for i in range(len(datasets))]
+        
+        # Calculate dataset sizes and weights
+        self.sizes = [len(ds) for ds in datasets]
+        self.total_size = sum(self.sizes)
+        
+        # Calculate weights to balance datasets
+        max_size = max(self.sizes)
+        self.weights = [max_size / size for size in self.sizes]
+        
+        # Create dataset indices for tracking source
+        self.dataset_indices = []
+        for i, size in enumerate(self.sizes):
+            self.dataset_indices.extend([i] * size)
+        
+        print(f"Created combined dataset with {self.total_size} samples:")
+        for i, (name, size, weight) in enumerate(zip(self.dataset_names, self.sizes, self.weights)):
+            print(f"  {name}: {size} samples, weight: {weight:.2f}")
+    
+    def __len__(self):
+        """Return the total number of samples."""
+        return self.total_size
+    
+    def __getitem__(self, idx):
+        """Get a sample based on the combined index.
+        
+        Args:
+            idx: Combined dataset index
+            
+        Returns:
+            tuple: (observed sequence, future sequence, metadata)
+        """
+        # Get source dataset index
+        dataset_idx = self.dataset_indices[idx]
+        
+        # Calculate index within the source dataset
+        local_idx = idx
+        for i in range(dataset_idx):
+            local_idx -= self.sizes[i]
+        
+        # Get item from source dataset
+        obs, fut, metadata = self.datasets[dataset_idx][local_idx]
+        
+        # Add source dataset to metadata
+        metadata['source_dataset'] = self.dataset_names[dataset_idx]
+        
+        return obs, fut, metadata
+    
+    def get_sample_weights(self):
+        """Get sample weights for balanced sampling.
+        
+        Returns:
+            torch.Tensor: Weights for each sample
+        """
+        sample_weights = torch.ones(self.total_size)
+        start_idx = 0
+        
+        for i, size in enumerate(self.sizes):
+            sample_weights[start_idx:start_idx + size] = self.weights[i]
+            start_idx += size
+            
+        return sample_weights
 
 def create_simulator_dataset(model, dataset, output_path, num_samples=100, device=None):
     """

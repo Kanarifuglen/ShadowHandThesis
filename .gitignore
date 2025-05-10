@@ -12,8 +12,6 @@ __pycache__/
 *.zip
 *.npz
 
-# Plots and debug images
-*.png
 
 # Temporary files
 tmp_*.h5

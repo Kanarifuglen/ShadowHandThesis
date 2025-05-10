@@ -32,6 +32,7 @@ from dct_utils import (
     batch_dct_transform,
     batch_idct_transform
 )
+from dataset import CombinedDataset
 
 
 def main():
@@ -45,7 +46,7 @@ def main():
     parser.add_argument('--weight-decay', type=float, default=1e-5, help="Weight decay")
     parser.add_argument('--subset-size', type=int, default=None, help="Use a subset of data for debugging")
     parser.add_argument('--model-path', type=str, default=DEFAULT_MODEL_PATH, help="Path for saving/loading model")
-    
+
     # Dataset filtering options
     parser.add_argument('--save-dataset', action='store_true', help="Save filtered HDF5 movement keys")
     parser.add_argument('--load-dataset', action='store_true', help="Load filtered HDF5 movement keys")
@@ -53,6 +54,7 @@ def main():
     parser.add_argument('--filter-save', action='store_true', help="Filter and save a clean dataset")
     parser.add_argument('--filtered-output', type=str, default="../datasets/shadow_dataset_filtered.h5", 
                    help="Output path for filtered dataset")
+ 
     # Data splitting parameters
     parser.add_argument('--split-type', choices=['subject', 'movement', 'random'], default='subject',
                       help="How to split the dataset for train/test (by subject, movement, or random)")
@@ -62,15 +64,23 @@ def main():
                       help="Specific subjects to use for testing (for subject split)")
     parser.add_argument('--cross-val', action='store_true', help="Use cross-validation")
     parser.add_argument('--n-folds', type=int, default=5, help="Number of folds for cross-validation")
+
+    # Simulator dataset creation
     parser.add_argument('--create-sim-data', action='store_true', 
                    help="Create a dataset of predicted movements for simulator visualization")
     parser.add_argument('--sim-data-path', type=str, default="../sim_data/predictions.h5", 
                     help="Path to save simulator-compatible dataset")
     parser.add_argument('--sim-samples', type=int, default=100, 
                     help="Number of samples to include in simulator dataset")
+  
+    # Combined dataset options
+    parser.add_argument('--new-data', type=str, default=None, 
+                      help="Path to additional dataset for combined training")
+    parser.add_argument('--combined-training', action='store_true',
+                      help="Train on combined datasets (requires --new-data)")
 
     args = parser.parse_args()
-    
+
     # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -83,7 +93,7 @@ def main():
             filtered_keys = pickle.load(f)
         print(f"Found {len(filtered_keys)} prefiltered keys")
     
-    # Create dataset
+    # Create primary dataset
     dataset = MovementDataset(
         h5_path=args.data,
         T_obs=T_OBS,
@@ -112,11 +122,25 @@ def main():
                 in_grp.copy(key, out_grp)
         print(f"✅ Filtered dataset saved to {args.filtered_output}")
     
-    # Create data splits for train/test
+    # Create secondary dataset if specified
+    new_dataset = None
+    if args.new_data:
+        print(f"Loading additional dataset from {args.new_data}")
+        new_dataset = MovementDataset(
+            h5_path=args.new_data,
+            T_obs=T_OBS,
+            T_pred=T_PRED,
+            dataset_type="additional"
+        )
+    
+    # Create data splits for train/test for primary dataset
     train_keys, test_keys = None, None
+    model = None
+    test_dataset_for_sim = None
     
     if args.cross_val:
-        best_model, train_keys, test_keys, test_dataset_for_sim = run_cross_validation(dataset, args, device)
+        # Run cross-validation on primary dataset
+        model, train_keys, test_keys, test_dataset_for_sim = run_cross_validation(dataset, args, device)
     else:
         # Create a single train/test split
         if args.split_type == 'subject':
@@ -135,7 +159,7 @@ def main():
             test_keys = [dataset.valid_samples[i] for i in test_indices]
             print(f"Random split: {len(train_keys)} training samples, {len(test_keys)} testing samples")
 
-    # Create train and test datasets
+    # Create train and test datasets for primary data
     train_dataset = MovementDataset(
         h5_path=args.data,
         T_obs=T_OBS,
@@ -153,8 +177,70 @@ def main():
         filtered_keys=test_keys,
         dataset_type="test"
     )
-
     
+    # Handle combined dataset training if requested
+    if args.combined_training and new_dataset:
+        print("Creating combined dataset for training...")
+        
+        # Split the new dataset
+        if args.split_type == 'subject':
+            new_train_keys, new_test_keys = create_subject_split(
+                new_dataset, test_subjects=args.test_subjects, test_ratio=args.test_ratio
+            )
+        elif args.split_type == 'movement':
+            new_train_keys, new_test_keys = create_movement_split(
+                new_dataset, test_ratio=args.test_ratio
+            )
+        else:  # random split
+            import random
+            indices = list(range(len(new_dataset)))
+            random.shuffle(indices)
+            split = int(len(indices) * (1 - args.test_ratio))
+            new_train_indices = indices[:split]
+            new_test_indices = indices[split:]
+            new_train_keys = [new_dataset.valid_samples[i] for i in new_train_indices]
+            new_test_keys = [new_dataset.valid_samples[i] for i in new_test_indices]
+        
+        # Create train and test datasets for the new data
+        new_train_dataset = MovementDataset(
+            h5_path=args.new_data,
+            T_obs=T_OBS,
+            T_pred=T_PRED,
+            prefiltered=True,
+            filtered_keys=new_train_keys,
+            dataset_type="additional_training"
+        )
+        
+        new_test_dataset = MovementDataset(
+            h5_path=args.new_data,
+            T_obs=T_OBS,
+            T_pred=T_PRED,
+            prefiltered=True,
+            filtered_keys=new_test_keys,
+            dataset_type="additional_test"
+        )
+        
+        # Create combined datasets
+        combined_train_dataset = CombinedDataset(
+            [train_dataset, new_train_dataset],
+            ["original", "additional"]
+        )
+        
+        combined_test_dataset = CombinedDataset(
+            [test_dataset, new_test_dataset],
+            ["original", "additional"]
+        )
+        
+        # Use the combined datasets for training and testing
+        train_dataset = combined_train_dataset
+        test_dataset = combined_test_dataset
+        
+        # Set flag for weighted sampling
+        use_weighted_sampling = True
+    else:
+        use_weighted_sampling = False
+    
+    # If not using cross-validation, proceed with standard training and testing
     if not args.cross_val:
         # Train model
         if args.mode in ['train', 'both']:
@@ -170,13 +256,14 @@ def main():
             # Train model
             model = train_model(
                 model=model,
-                dataset=train_dataset,  # Use training dataset for training
+                dataset=train_dataset,
                 epochs=args.epochs,
                 batch_size=args.batch_size,
                 learning_rate=args.learning_rate,
                 weight_decay=args.weight_decay,
                 save_path=args.model_path,
-                device=device
+                device=device,
+                use_weighted_sampling=use_weighted_sampling
             )
         
         # Test model using the modular evaluation function
@@ -210,31 +297,30 @@ def main():
                 json.dump(results, f, indent=2)
             print("Saved ../evaluations/evaluation_results.json")
 
-
-        if args.create_sim_data:
-            # Load model if needed
-            if 'model' not in locals():
-                model = create_model(
-                    d_model=128,
-                    nhead=8,
-                    num_layers=3,
-                    dim_feedforward=512,
-                    use_memory=not args.no_memory,
-                    progressive=not args.no_progressive,
-                    device=device
-                )
-                model.load_state_dict(torch.load(args.model_path, map_location=device))
-            
-            # Create simulator dataset
-            create_simulator_dataset(
-                model=model,
-                dataset=test_dataset,
-                output_path=args.sim_data_path,
-                num_samples=args.sim_samples,
+    # Create simulator dataset if requested
+    if args.create_sim_data:
+        # Determine which dataset to use for simulation
+        sim_dataset = test_dataset_for_sim if test_dataset_for_sim is not None else test_dataset
+        
+        # Load model if needed
+        if model is None:
+            model = create_model(
+                d_model=128,
+                nhead=8,
+                num_layers=3,
+                dim_feedforward=512,
                 device=device
             )
+            model.load_state_dict(torch.load(args.model_path, map_location=device))
         
-        
+        # Create simulator dataset
+        create_simulator_dataset(
+            model=model,
+            dataset=sim_dataset,
+            output_path=args.sim_data_path,
+            num_samples=args.sim_samples,
+            device=device
+        )
 
 if __name__ == "__main__":
     main()

@@ -18,6 +18,7 @@ from dataset import MovementDataset, create_simulator_dataset
 from model import create_model
 from evaluation import evaluate_model
 import json
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 # Import configuration
 from config import (
@@ -129,7 +130,8 @@ def create_cross_validation_splits(dataset, n_folds=5, by='subject_id'):
 
 
 def train_model(model, dataset, epochs=20, batch_size=8, learning_rate=1e-4, 
-                weight_decay=1e-5, save_path=DEFAULT_MODEL_PATH, device=None):
+                weight_decay=1e-5, save_path=DEFAULT_MODEL_PATH, device=None,
+                use_weighted_sampling=False):
     """Train the motion prediction model.
     
     Args:
@@ -140,7 +142,8 @@ def train_model(model, dataset, epochs=20, batch_size=8, learning_rate=1e-4,
         learning_rate: Learning rate for optimizer
         weight_decay: Weight decay for optimizer
         save_path: Path to save the best model
-        device: Device to run training on (default: None, will use CUDA if available)
+        device: Device to run training on
+        use_weighted_sampling: Whether to use weighted sampling (for combined datasets)
         
     Returns:
         Trained model
@@ -148,14 +151,32 @@ def train_model(model, dataset, epochs=20, batch_size=8, learning_rate=1e-4,
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Create DataLoader
-    loader = DataLoader(
-        dataset, 
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=2,  # Reduce from 4 to 2 to reduce memory overhead
-        pin_memory=True
-    )
+    # Create DataLoader with appropriate sampler
+    if use_weighted_sampling and hasattr(dataset, 'get_sample_weights'):
+        # Get sample weights from combined dataset
+        weights = dataset.get_sample_weights()
+        sampler = WeightedRandomSampler(
+            weights=weights,
+            num_samples=len(dataset),
+            replacement=True
+        )
+        loader = DataLoader(
+            dataset, 
+            batch_size=batch_size,
+            sampler=sampler,  # Use weighted sampler
+            num_workers=2,
+            pin_memory=True
+        )
+        print("Using weighted sampling for combined dataset")
+    else:
+        # Standard DataLoader with shuffling
+        loader = DataLoader(
+            dataset, 
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=2,
+            pin_memory=True
+        )
     
     # Create optimizer with weight decay
     optimizer = optim.AdamW(
@@ -188,7 +209,7 @@ def train_model(model, dataset, epochs=20, batch_size=8, learning_rate=1e-4,
         total_loss, total_mae = 0, 0
         
         with tqdm(loader, desc=f"Epoch {epoch+1}/{epochs}") as progress_bar:
-            for obs_batch, fut_batch, _ in progress_bar:
+            for obs_batch, fut_batch, metadata in progress_bar:
                 B = obs_batch.size(0)
                 obs_batch = obs_batch.to(device)  # (B, T_OBS, J)
                 fut_batch = fut_batch.to(device)  # (B, T_PRED, J)
@@ -248,11 +269,27 @@ def train_model(model, dataset, epochs=20, batch_size=8, learning_rate=1e-4,
                 total_loss += loss.item()
                 total_mae += mae
                 
-                # Update progress bar
-                progress_bar.set_postfix({
+                # Add dataset source to progress bar if available
+                postfix = {
                     'loss': loss.item(),
                     'mae': f"{mae:.4f}"
-                })
+                }
+                
+                # If using a combined dataset, track dataset distribution
+                if 'source_dataset' in metadata:
+                    sources = metadata['source_dataset']
+                    sources_count = {}
+                    for source in sources:
+                        if source in sources_count:
+                            sources_count[source] += 1
+                        else:
+                            sources_count[source] = 1
+                    
+                    source_info = "/".join([f"{k}:{v}" for k, v in sources_count.items()])
+                    postfix['sources'] = source_info
+                
+                # Update progress bar
+                progress_bar.set_postfix(postfix)
         
         # Calculate average metrics
         avg_loss = total_loss / len(loader)
@@ -296,7 +333,6 @@ def train_model(model, dataset, epochs=20, batch_size=8, learning_rate=1e-4,
     print(f"📊 Saved training curves to '{PLOTS_DIR}/training_curves.png'")
 
     return model
-
 
 
 def run_cross_validation(dataset, args, device):
@@ -418,18 +454,23 @@ def run_cross_validation(dataset, args, device):
         
         # Save aggregated results
         os.makedirs('../evaluations/cross_validation', exist_ok=True)
+        json_data = {
+            'average': avg_results,
+            'per_fold': all_fold_results,
+            'best_fold': {
+                'fold_score': best_fold_score,
+                'fold_idx': np.argmin([
+                    np.mean([v for v in fold['overall'].values()]) 
+                    for fold in all_fold_results
+                ])
+            }
+        }
+        # Convert NumPy types to Python native types
+        json_data = convert_numpy_to_python(json_data)
+
+        # Now it's safe to dump to JSON
         with open('../evaluations/cross_validation/aggregated_results.json', 'w') as f:
-            json.dump({
-                'average': avg_results,
-                'per_fold': all_fold_results,
-                'best_fold': {
-                    'fold_score': best_fold_score,
-                    'fold_idx': np.argmin([
-                        np.mean([v for v in fold['overall'].values()]) 
-                        for fold in all_fold_results
-                    ])
-                }
-            }, f, indent=2)
+            json.dump(json_data, f, indent=2)
         
         # Print aggregated results
         print("\n===== Cross-Validation Results =====")
@@ -455,3 +496,20 @@ def run_cross_validation(dataset, args, device):
     
     # Return best model, first fold splits, and best test dataset
     return best_fold_model, cv_splits[0][0], cv_splits[0][1], best_fold_test_dataset
+
+
+
+def convert_numpy_to_python(obj):
+    """Convert NumPy types to Python native types for JSON serialization."""
+    import numpy as np
+    if isinstance(obj, (np.integer, np.int64, np.int32)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float64, np.float32)):
+        return float(obj)
+    elif isinstance(obj, (np.ndarray,)):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {key: convert_numpy_to_python(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_numpy_to_python(item) for item in obj]
+    return obj
