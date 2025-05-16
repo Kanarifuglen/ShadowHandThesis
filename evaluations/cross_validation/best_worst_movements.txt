@@ -1,0 +1,13 @@
+Best performing movements:
+1. C_15: Tip pinch grasp: 0.2631 radians
+2. C_32: Unknown: 0.2663 radians
+3. C_7: Prismatic four fingers grasp: 0.2667 radians
+4. C_17: Lateral grasp: 0.2740 radians
+5. C_16: Quadpod grasp: 0.2766 radians
+
+Worst performing movements:
+1. B_9: Wrist supination (MF axis): 0.7210 radians
+2. B_10: Wrist supination: 0.7222 radians
+3. B_15: Wrist radial deviation: 0.7435 radians
+4. B_16: Wrist ulnar deviation: 0.7481 radians
+5. B_13: Wrist flexion: 0.7543 radians

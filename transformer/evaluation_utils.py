@@ -16,28 +16,64 @@ from config import (
 )
 
 def plot_per_joint_error(predictions, targets, mask, joint_names=JOINT_NAMES):
-    """Create a bar chart showing error for each individual joint."""
+    """Enhanced version to match thesis requirements for Fig ref:joint_error."""
     joint_errors = []
     for j in range(targets.shape[-1]):
-        if mask[j]:  # Skip masked joints (thumb joints and LFJ5)
+        if mask[j]:  # Skip masked joints
             joint_error = (predictions[:, :, j] - targets[:, :, j]).abs().mean().item()
             joint_errors.append((joint_names[j], joint_error))
     
-    # Sort by error value
-    joint_errors.sort(key=lambda x: x[1], reverse=True)
+    # Define joint groups for better visualization
+    joint_groups = {
+        'Wrist': ['WRJ1', 'WRJ2'],
+        'Thumb': ['THJ1', 'THJ2', 'THJ3', 'THJ4', 'THJ5'],
+        'Index': ['FFJ1', 'FFJ2', 'FFJ3', 'FFJ4'],
+        'Middle': ['MFJ1', 'MFJ2', 'MFJ3', 'MFJ4'],
+        'Ring': ['RFJ1', 'RFJ2', 'RFJ3', 'RFJ4'],
+        'Little': ['LFJ1', 'LFJ2', 'LFJ3', 'LFJ4', 'LFJ5']
+    }
     
-    # Create plot
+    # Assign colors to joint groups
+    group_colors = {
+        'Wrist': 'blue',
+        'Thumb': 'green',
+        'Index': 'red',
+        'Middle': 'orange',
+        'Ring': 'purple',
+        'Little': 'brown'
+    }
+    
+    # Create figure
     plt.figure(figsize=(12, 6))
+    
+    # Get colors for each joint
+    colors = []
+    for name, _ in joint_errors:
+        for group, joints in joint_groups.items():
+            if name in joints:
+                colors.append(group_colors[group])
+                break
+        else:
+            colors.append('gray')
+    
+    # Extract data for plotting
     names, errors = zip(*joint_errors)
-    plt.bar(names, errors)
+    
+    # Plot with custom colors for each joint group
+    plt.bar(names, errors, color=colors)
     plt.xticks(rotation=45, ha='right')
     plt.title("Mean Error per Joint")
     plt.ylabel("Mean Absolute Error (radians)")
+    plt.grid(True, axis='y', linestyle='--', alpha=0.7)
+    
+    # Add legend for joint groups
+    handles = [plt.Rectangle((0,0),1,1, color=color) for color in group_colors.values()]
+    plt.legend(handles, group_colors.keys(), loc='upper right')
+    
     plt.tight_layout()
     
-    # Ensure directory exists
-    os.makedirs(PLOTS_DIR, exist_ok=True)
-    plt.savefig(f"{PLOTS_DIR}/per_joint_error.png")
+    # Save with high resolution
+    plt.savefig(f"{PLOTS_DIR}/per_joint_error.png", dpi=300)
     plt.close()
 
 
@@ -154,7 +190,7 @@ def generate_detailed_error_table(movement_results, eval_ms=EVAL_MS,
 
 def generate_joint_group_table(predictions, targets, joint_names=JOINT_NAMES):
     """Create a table analyzing performance by joint groups for the Shadow hand."""
-    # Define joint groups for Shadow Hand
+    # Define joint groups
     joint_groups = {
         'Wrist': [0, 1],                 # WRJ1, WRJ2
         'Thumb': [2, 3, 4, 5, 6],        # THJ1-5
@@ -164,49 +200,123 @@ def generate_joint_group_table(predictions, targets, joint_names=JOINT_NAMES):
         'Little': [19, 20, 21, 22, 23]   # LFJ1-5
     }
     
-    # Ensure directory exists
+    # Create output directory
     os.makedirs(EVALUATIONS_DIR, exist_ok=True)
     
+    # Generate CSV table
     with open(f'{EVALUATIONS_DIR}/joint_group_analysis.csv', 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
-        writer.writerow(['Joint Group', 'Mean Error', 'Max Error', 'Min Error'])
+        writer.writerow(['Joint Group', 'Mean Error', 'Max Error', 'Min Error', 'Standard Deviation'])
         
+        # Calculate statistics for each group
         for group_name, indices in joint_groups.items():
             group_errors = []
             
             for j in indices:
+                # Skip masked joints
+                if j in MASKED_JOINTS:
+                    continue
+                    
                 joint_error = (predictions[:, :, j] - targets[:, :, j]).abs().mean().item()
                 group_errors.append(joint_error)
             
             if group_errors:
                 writer.writerow([
                     group_name, 
-                    f"{sum(group_errors)/len(group_errors):.4f}",
-                    f"{max(group_errors):.4f}",
-                    f"{min(group_errors):.4f}"
+                    f"{np.mean(group_errors):.4f}",
+                    f"{np.max(group_errors):.4f}",
+                    f"{np.min(group_errors):.4f}",
+                    f"{np.std(group_errors):.4f}"
                 ])
     
-    print(f"Joint group analysis exported to {EVALUATIONS_DIR}/joint_group_analysis.csv")
+    # Generate visualized version as figure
+    plt.figure(figsize=(10, 6))
+    
+    group_means = []
+    group_stds = []
+    group_names = []
+    
+    for group_name, indices in joint_groups.items():
+        group_errors = []
+        
+        for j in indices:
+            if j not in MASKED_JOINTS:
+                joint_error = (predictions[:, :, j] - targets[:, :, j]).abs().mean().item()
+                group_errors.append(joint_error)
+        
+        if group_errors:
+            group_means.append(np.mean(group_errors))
+            group_stds.append(np.std(group_errors))
+            group_names.append(group_name)
+    
+    # Sort by mean error
+    sorted_indices = np.argsort(group_means)
+    sorted_means = [group_means[i] for i in sorted_indices]
+    sorted_stds = [group_stds[i] for i in sorted_indices]
+    sorted_names = [group_names[i] for i in sorted_indices]
+    
+    # Plot with error bars
+    plt.bar(range(len(sorted_names)), sorted_means, yerr=sorted_stds, 
+            capsize=5, color='skyblue', edgecolor='navy')
+    plt.xticks(range(len(sorted_names)), sorted_names, rotation=45)
+    plt.ylabel('Mean Absolute Error (radians)')
+    plt.title('Average Error by Joint Group')
+    plt.grid(True, axis='y', linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    plt.savefig(f'{PLOTS_DIR}/joint_group_error.png', dpi=300)
+    plt.close()
+    
+    print(f"Joint group analysis saved to {EVALUATIONS_DIR}/joint_group_analysis.csv")
+    print(f"Joint group visualization saved to {PLOTS_DIR}/joint_group_error.png")
 
 
 def analyze_dct_coefficients(input_dct, baseline_dct, pred_residual):
-    """Create a table analyzing the importance of different DCT coefficients."""
-    # Ensure directory exists
+    """Enhanced DCT coefficient analysis for thesis Figure/Table."""
+    # Create output directory
     os.makedirs(EVALUATIONS_DIR, exist_ok=True)
     
+    # Number of coefficients to analyze
+    num_coeffs = min(20, input_dct.shape[1])
+    
+    # Calculate average magnitude across batch and joints
+    input_mag = input_dct[:, :num_coeffs, :].abs().mean(dim=(0, 2)).cpu().numpy()
+    baseline_mag = baseline_dct[:, :num_coeffs, :].abs().mean(dim=(0, 2)).cpu().numpy()
+    residual_mag = pred_residual[:, :num_coeffs, :].abs().mean(dim=(0, 2)).cpu().numpy()
+    
+    # Save in CSV format for paper table
     with open(f'{EVALUATIONS_DIR}/dct_coefficient_analysis.csv', 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
-        writer.writerow(['Coefficient Index', 'Mean Magnitude in Input', 'Mean Magnitude in Baseline', 'Mean Magnitude in Residual'])
+        writer.writerow(['Coefficient Index', 'Input Magnitude', 'Baseline Magnitude', 'Residual Magnitude'])
         
-        for i in range(input_dct.shape[1]):
-            input_mag = input_dct[:, i, :].abs().mean().item()
-            baseline_mag = baseline_dct[:, i, :].abs().mean().item() if i < baseline_dct.shape[1] else 0
-            residual_mag = pred_residual[:, i, :].abs().mean().item() if i < pred_residual.shape[1] else 0
-            
-            writer.writerow([i, f"{input_mag:.6f}", f"{baseline_mag:.6f}", f"{residual_mag:.6f}"])
+        for i in range(num_coeffs):
+            writer.writerow([
+                i, 
+                f"{input_mag[i]:.6f}", 
+                f"{baseline_mag[i]:.6f}", 
+                f"{residual_mag[i]:.6f}"
+            ])
+    
+    # Create visualization for thesis
+    plt.figure(figsize=(10, 6))
+    
+    # Plot each line with different style
+    x = np.arange(num_coeffs)
+    plt.plot(x, input_mag, 'o-', label='Input DCT Coefficients', linewidth=2)
+    plt.plot(x, baseline_mag, 's--', label='Baseline DCT Coefficients', linewidth=2)
+    plt.plot(x, residual_mag, '^-', label='Predicted Residual Coefficients', linewidth=2)
+    
+    plt.xlabel('DCT Coefficient Index')
+    plt.ylabel('Average Magnitude')
+    plt.title('DCT Coefficient Magnitude Analysis')
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.savefig(f'{PLOTS_DIR}/dct_coefficient_analysis.png', dpi=300)
+    plt.close()
     
     print(f"DCT coefficient analysis exported to {EVALUATIONS_DIR}/dct_coefficient_analysis.csv")
-
+    print(f"DCT coefficient visualization saved to {PLOTS_DIR}/dct_coefficient_analysis.png")
 
 def visualize_predictions(pred, target, sample_idx, movement_name, num_joints):
     """Visualize predictions in a standardized format.

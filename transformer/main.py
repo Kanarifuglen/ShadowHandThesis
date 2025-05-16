@@ -78,12 +78,75 @@ def main():
                       help="Path to additional dataset for combined training")
     parser.add_argument('--combined-training', action='store_true',
                       help="Train on combined datasets (requires --new-data)")
+    
+    # Add skip-training option for resuming interrupted runs
+    parser.add_argument('--skip-training', action='store_true', 
+                      help="Skip model training and use existing model files (useful for resuming analysis)")
+    parser.add_argument('--analysis-only', action='store_true',
+                      help="Run only the final analysis phase (for recovering from errors)")
 
     args = parser.parse_args()
 
     # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+    
+    # If analysis-only flag is set, run the recovery directly
+    if args.analysis_only:
+        print("\n===== Running Analysis-Only Mode =====")
+        from cross_val import recover_cv_results
+        
+        best_idx, best_score, best_path = recover_cv_results(
+            args.data, 
+            args.model_path, 
+            args.n_folds, 
+            device
+        )
+        
+        print(f"Analysis complete. Best fold: {best_idx+1} with score {best_score:.4f}")
+        print(f"Best model path: {best_path}")
+        
+        # Create simulator data using the best model if requested
+        if args.create_sim_data and best_path:
+            # Create a test dataset for the best fold
+            cv_splits_path = "../evaluations/cross_validation/cv_splits.pkl"
+            if os.path.exists(cv_splits_path):
+                with open(cv_splits_path, 'rb') as f:
+                    cv_splits = pickle.load(f)
+                
+                if 0 <= best_idx < len(cv_splits):
+                    _, test_keys = cv_splits[best_idx]
+                    
+                    best_test_dataset = MovementDataset(
+                        h5_path=args.data,
+                        T_obs=T_OBS,
+                        T_pred=T_PRED,
+                        prefiltered=True,
+                        filtered_keys=test_keys,
+                        dataset_type=f"test_fold_{best_idx+1}"
+                    )
+                    
+                    # Load best model
+                    best_model = create_model(
+                        d_model=128,
+                        nhead=8,
+                        num_layers=3,
+                        dim_feedforward=512,
+                        device=device
+                    )
+                    best_model.load_state_dict(torch.load(best_path, map_location=device))
+                    
+                    # Create simulator dataset
+                    sim_path = args.sim_data_path.replace('.h5', f'_best_fold_{best_idx+1}.h5')
+                    create_simulator_dataset(
+                        model=best_model,
+                        dataset=best_test_dataset,
+                        output_path=sim_path,
+                        num_samples=args.sim_samples,
+                        device=device
+                    )
+        
+        return  # Exit the script after analysis
     
     # Check if we should load prefiltered keys
     filtered_keys = None
@@ -140,7 +203,9 @@ def main():
     
     if args.cross_val:
         # Run cross-validation on primary dataset
-        model, train_keys, test_keys, test_dataset_for_sim = run_cross_validation(dataset, args, device)
+        model, train_keys, test_keys, test_dataset_for_sim = run_cross_validation(
+            dataset, args, device, skip_training=args.skip_training
+        )
     else:
         # Create a single train/test split
         if args.split_type == 'subject':
@@ -243,7 +308,7 @@ def main():
     # If not using cross-validation, proceed with standard training and testing
     if not args.cross_val:
         # Train model
-        if args.mode in ['train', 'both']:
+        if args.mode in ['train', 'both'] and not args.skip_training:
             # Create model
             model = create_model(
                 d_model=128,
@@ -267,8 +332,8 @@ def main():
             )
         
         # Test model using the modular evaluation function
-        if args.mode in ['test', 'both']:
-            if args.mode == 'test':
+        if args.mode in ['test', 'both'] or args.skip_training:
+            if args.mode == 'test' or args.skip_training or model is None:
                 # Create model and load weights
                 model = create_model(
                     d_model=128,

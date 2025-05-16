@@ -6,7 +6,9 @@ and other training-related utilities.
 """
 
 import os
+import pickle
 import random
+import shutil
 import numpy as np
 import torch
 import torch.nn as nn
@@ -335,9 +337,9 @@ def train_model(model, dataset, epochs=20, batch_size=8, learning_rate=1e-4,
     return model
 
 
-def run_cross_validation(dataset, args, device):
+def run_cross_validation(dataset, args, device, skip_training=False):
     """
-    Run full k-fold cross-validation.
+    Run full k-fold cross-validation with enhanced thesis-specific evaluations.
     
     Args:
         dataset: The full dataset to split into folds
@@ -350,16 +352,27 @@ def run_cross_validation(dataset, args, device):
     print(f"Creating {args.n_folds}-fold cross-validation splits by {args.split_type}...")
     cv_splits = create_cross_validation_splits(dataset, n_folds=args.n_folds, by=args.split_type + '_id')
     
+    # Save the CV splits for reproducibility
+    os.makedirs('../evaluations/cross_validation', exist_ok=True)
+    with open('../evaluations/cross_validation/cv_splits.pkl', 'wb') as f:
+        pickle.dump(cv_splits, f)
+    print(f"Saved cross-validation splits to '../evaluations/cross_validation/cv_splits.pkl'")
+    
     # Store results across folds
     all_fold_results = []
     best_fold_score = float('inf')
     best_fold_model = None
+    best_fold_idx = 0
     best_fold_test_dataset = None
+    
+    # Define target horizons to match thesis requirements
+    target_horizons = [80, 160, 320, 400, 600, 1000]  # in ms
     
     # Loop through all folds
     for fold_idx, (fold_train_keys, fold_test_keys) in enumerate(cv_splits):
         print(f"\n===== Processing Fold {fold_idx+1}/{args.n_folds} =====")
         print(f"Training set: {len(fold_train_keys)} samples, Test set: {len(fold_test_keys)} samples")
+        
         # Create datasets for this fold
         fold_train_dataset = MovementDataset(
             h5_path=args.data,
@@ -379,19 +392,27 @@ def run_cross_validation(dataset, args, device):
             dataset_type=f"test_fold_{fold_idx+1}"
         )
         
+        # Set fold-specific model path
+        fold_model_path = args.model_path.replace('.pth', f'_fold_{fold_idx+1}.pth')
+        
         # Create model for this fold
-        if args.mode in ['train', 'both']:
-            fold_model = create_model(
-                d_model=128,
-                nhead=8,
-                num_layers=3,
-                dim_feedforward=512,
-                device=device
-            )
-            
-            # Set fold-specific model path
-            fold_model_path = args.model_path.replace('.pth', f'_fold_{fold_idx+1}.pth')
-            
+        fold_model = create_model(
+            d_model=128,
+            nhead=8,
+            num_layers=3,
+            dim_feedforward=512,
+            device=device
+        )
+        
+        # If skipping training, try to load existing model
+        if skip_training:
+            if os.path.exists(fold_model_path):
+                print(f"Loading existing model from {fold_model_path}")
+                fold_model.load_state_dict(torch.load(fold_model_path, map_location=device))
+            else:
+                print(f"WARNING: Skip-training specified but no model found at {fold_model_path}")
+        # Otherwise train the model if needed
+        elif args.mode in ['train', 'both']:
             # Train model for this fold
             fold_model = train_model(
                 model=fold_model,
@@ -404,79 +425,77 @@ def run_cross_validation(dataset, args, device):
                 device=device
             )
         else:  # Only testing
-            fold_model = create_model(
-                d_model=128,
-                nhead=8,
-                num_layers=3,
-                dim_feedforward=512,
-                device=device
-            )
-            fold_model_path = args.model_path.replace('.pth', f'_fold_{fold_idx+1}.pth')
             if os.path.exists(fold_model_path):
                 fold_model.load_state_dict(torch.load(fold_model_path, map_location=device))
             else:
                 print(f"Warning: No model found at {fold_model_path}, using default path")
                 fold_model.load_state_dict(torch.load(args.model_path, map_location=device))
+            
+            # Evaluate model on this fold
+            if args.mode in ['test', 'both']:
+                # Create fold-specific output directory
+                fold_output_dir = f"../evaluations/fold_{fold_idx+1}"
+                os.makedirs(fold_output_dir, exist_ok=True)
+                
+                # Run enhanced evaluation
+                fold_results = evaluate_model(
+                    model=fold_model,
+                    dataset=fold_test_dataset,
+                    build_dct_matrix=build_dct_matrix,
+                    build_idct_matrix=build_idct_matrix,
+                    batch_dct_transform=batch_dct_transform,
+                    batch_idct_transform=batch_idct_transform,
+                    device=device,
+                    batch_size=args.batch_size,
+                    output_dir=fold_output_dir
+                )
+                
+                # Store results for this fold
+                all_fold_results.append(fold_results)
+                
+                # Track best fold based on average error (lower is better)
+                avg_error = np.mean([v for v in fold_results['overall'].values()])
+                if avg_error < best_fold_score:
+                    best_fold_score = avg_error
+                    best_fold_model = fold_model
+                    best_fold_idx = fold_idx
+                    best_fold_test_dataset = fold_test_dataset
         
-        # Evaluate model on this fold
-        if args.mode in ['test', 'both']:
-            fold_results = evaluate_model(
-                model=fold_model,
-                dataset=fold_test_dataset,
-                build_dct_matrix=build_dct_matrix,
-                build_idct_matrix=build_idct_matrix,
-                batch_dct_transform=batch_dct_transform,
-                batch_idct_transform=batch_idct_transform,
-                device=device,
-                batch_size=args.batch_size,
-                output_dir=f"../evaluations/fold_{fold_idx+1}"
-            )
-            
-            # Store results for this fold
-            all_fold_results.append(fold_results)
-            
-            # Track best fold based on average error (lower is better)
-            avg_error = np.mean([v for v in fold_results['overall'].values()])
-            if avg_error < best_fold_score:
-                best_fold_score = avg_error
-                best_fold_model = fold_model
-                best_fold_test_dataset = fold_test_dataset
-    
-    # Aggregate results across folds
+    # Generate thesis-specific analyses using recover_cv_results
     if args.mode in ['test', 'both'] and all_fold_results:
-        # Compute average metrics across folds
-        avg_results = {'overall': {}, 'by_table': {}, 'by_movement': {}}
+        # First aggregate results as before for backward compatibility
+        aggregate_cv_results(all_fold_results, best_fold_score, best_fold_idx)
         
-        # Average overall metrics
-        for ms in all_fold_results[0]['overall'].keys():
-            values = [fold['overall'][ms] for fold in all_fold_results]
-            avg_results['overall'][ms] = float(np.mean(values))
+        # Now use the enhanced recover_cv_results to generate all thesis visualizations
+        from cross_val import recover_cv_results
         
-        # Save aggregated results
-        os.makedirs('../evaluations/cross_validation', exist_ok=True)
-        json_data = {
-            'average': avg_results,
-            'per_fold': all_fold_results,
-            'best_fold': {
-                'fold_score': best_fold_score,
-                'fold_idx': np.argmin([
-                    np.mean([v for v in fold['overall'].values()]) 
-                    for fold in all_fold_results
-                ])
-            }
-        }
-        # Convert NumPy types to Python native types
-        json_data = convert_numpy_to_python(json_data)
-
-        # Now it's safe to dump to JSON
-        with open('../evaluations/cross_validation/aggregated_results.json', 'w') as f:
-            json.dump(json_data, f, indent=2)
+        print("\n===== Generating Thesis-Specific Visualizations and Analyses =====")
+        best_idx, best_score, best_path = recover_cv_results(
+            args.data, 
+            args.model_path, 
+            args.n_folds, 
+            device
+        )
         
-        # Print aggregated results
-        print("\n===== Cross-Validation Results =====")
-        print("Average error across all folds:")
-        for ms, value in avg_results['overall'].items():
-            print(f"  {ms}ms: {value:.4f}")
+        # If the best model from recover_cv_results differs, print a warning
+        if best_idx != best_fold_idx:
+            print(f"Warning: Best fold from recover_cv_results ({best_idx+1}) differs from training ({best_fold_idx+1})")
+            print(f"Using fold {best_fold_idx+1} for return values as it was selected during training")
+        
+        # Ensure the thesis outputs are created for the best fold
+        best_fold_model_path = args.model_path.replace('.pth', f'_fold_{best_fold_idx+1}.pth')
+        thesis_output_dir = f"../evaluations/thesis_outputs"
+        os.makedirs(thesis_output_dir, exist_ok=True)
+        
+        # Create a symbolic link to the best fold's evaluation outputs
+        if os.path.exists(f"../evaluations/fold_{best_fold_idx+1}"):
+            for file in os.listdir(f"../evaluations/fold_{best_fold_idx+1}"):
+                if os.path.isfile(f"../evaluations/fold_{best_fold_idx+1}/{file}"):
+                    # Copy or link best fold's files to thesis outputs
+                    shutil.copy2(
+                        f"../evaluations/fold_{best_fold_idx+1}/{file}",
+                        f"{thesis_output_dir}/{file}"
+                    )
         
         # Save best model from cross-validation
         best_model_path = args.model_path.replace('.pth', '_best_cv.pth')
@@ -498,6 +517,40 @@ def run_cross_validation(dataset, args, device):
     return best_fold_model, cv_splits[0][0], cv_splits[0][1], best_fold_test_dataset
 
 
+def aggregate_cv_results(all_fold_results, best_fold_score, best_fold_idx):
+    """Helper function to aggregate cross-validation results."""
+    # Compute average metrics across folds
+    avg_results = {'overall': {}, 'by_table': {}, 'by_movement': {}}
+    
+    # Average overall metrics
+    for ms in all_fold_results[0]['overall'].keys():
+        values = [fold['overall'][ms] for fold in all_fold_results if ms in fold['overall']]
+        if values:  # Only compute mean if values exist
+            avg_results['overall'][ms] = float(np.mean(values))
+    
+    # Save aggregated results
+    os.makedirs('../evaluations/cross_validation', exist_ok=True)
+    json_data = {
+        'average': avg_results,
+        'per_fold': all_fold_results,
+        'best_fold': {
+            'fold_score': best_fold_score,
+            'fold_idx': best_fold_idx
+        }
+    }
+    
+    # Convert NumPy types to Python native types
+    json_data = convert_numpy_to_python(json_data)
+
+    # Now it's safe to dump to JSON
+    with open('../evaluations/cross_validation/aggregated_results.json', 'w') as f:
+        json.dump(json_data, f, indent=2)
+    
+    # Print aggregated results
+    print("\n===== Cross-Validation Results =====")
+    print("Average error across all folds:")
+    for ms, value in avg_results['overall'].items():
+        print(f"  {ms}ms: {value:.4f}")
 
 def convert_numpy_to_python(obj):
     """Convert NumPy types to Python native types for JSON serialization."""

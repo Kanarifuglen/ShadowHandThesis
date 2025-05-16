@@ -5,6 +5,8 @@ This module contains functions for comprehensive evaluation of hand motion predi
 """
 
 import os
+
+from matplotlib import pyplot as plt
 import torch
 import numpy as np
 import csv
@@ -30,7 +32,7 @@ from evaluation_utils import (
 def evaluate_model(model, dataset, 
                    build_dct_matrix, build_idct_matrix, 
                    batch_dct_transform, batch_idct_transform,
-                   device=None, batch_size=32, output_dir=EVALUATIONS_DIR):
+                   device=None, batch_size=32, output_dir=None):
     """Comprehensive evaluation protocol for hand motion prediction models.
     
     Args:
@@ -42,13 +44,21 @@ def evaluate_model(model, dataset,
         batch_idct_transform: Function to apply inverse DCT to a batch of sequences
         device: Device to run evaluation on (default: None, will use CUDA if available)
         batch_size: Batch size for evaluation (default: 32)
-        output_dir: Directory to save evaluation outputs (default from config)
+        output_dir: Directory to save evaluation outputs
         
     Returns:
         Dictionary containing evaluation metrics
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    if output_dir is None:
+        output_dir = EVALUATIONS_DIR
+    
+    # Create output directories
+    os.makedirs(output_dir, exist_ok=True)
+    plots_dir = os.path.join(os.path.dirname(output_dir), "plots")
+    os.makedirs(plots_dir, exist_ok=True)
     
     # Create DataLoader
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
@@ -57,12 +67,16 @@ def evaluate_model(model, dataset,
     dct_m = build_dct_matrix(T_TOTAL).to(device)
     idct_m = build_idct_matrix(T_PRED).to(device)
     
-    # Get evaluation frames from config
-    eval_frames = [MS_TO_FRAMES[ms] for ms in EVAL_MS]
+    # Define time horizons to evaluate (in ms)
+    eval_ms = [80, 160, 320, 400, 600, 1000]
+    
+    # Convert ms to frame indices (assuming 25fps = 40ms per frame)
+    eval_frames = [int(ms / 40) for ms in eval_ms]
     
     # Track metrics by exercise table and movement ID
-    table_results = {}  # Results grouped by exercise table only (B or C)
-    detailed_results = {}  # Results grouped by exercise table AND movement ID (e.g., B_1)
+    table_results = {}  # Results grouped by exercise table
+    movement_results = {}  # Results grouped by detailed movement
+    joint_results = {}  # Results for each joint
     
     # For additional analysis
     all_preds = []
@@ -84,18 +98,19 @@ def evaluate_model(model, dataset,
             # Process each sample in the batch
             for i in range(B):
                 # Get exercise table and movement ID for improved categorization
-                exercise_table = str(metadata['exercise_table'][i])
-                movement_id = str(metadata['movement_id'][i])
+                exercise_table = str(tensor_to_python(metadata['exercise_table'][i]))
+                movement_id = str(tensor_to_python(metadata['movement_id'][i]))
+                movement_name = str(tensor_to_python(metadata['movement_name'][i]))
                 
                 # Create combined category for detailed analysis 
-                detailed_category = f"{exercise_table}_{movement_id}"
+                detailed_movement = f"{str(exercise_table)}_{str(movement_id)}: {str(movement_name)}"
                 
                 # Initialize dictionaries if needed
                 if exercise_table not in table_results:
-                    table_results[exercise_table] = {ms: [] for ms in EVAL_MS}
+                    table_results[exercise_table] = {str(ms): [] for ms in eval_ms}
                 
-                if detailed_category not in detailed_results:
-                    detailed_results[detailed_category] = {ms: [] for ms in EVAL_MS}
+                if detailed_movement not in movement_results:
+                    movement_results[detailed_movement] = {str(ms): [] for ms in eval_ms}
                 
                 # Standard prediction process
                 obs = obs_batch[i].unsqueeze(0)
@@ -138,50 +153,72 @@ def evaluate_model(model, dataset,
                 # Calculate error at each evaluation frame
                 for f_idx, frame in enumerate(eval_frames):
                     if frame < fut.shape[1]:  # Make sure frame exists
-                        # MAE for angle representation
+                        ms = eval_ms[f_idx]
+                        ms_str = str(ms)
+                        
+                        # MAE for angle representation - average over masked joints
                         error = (pred_fut[0, frame, mask] - fut[0, frame, mask]).abs().mean().item()
-                        table_results[exercise_table][EVAL_MS[f_idx]].append(error)
-                        detailed_results[detailed_category][EVAL_MS[f_idx]].append(error)
+                        
+                        # Add to table and movement results
+                        table_results[exercise_table][ms_str].append(tensor_to_python(error))
+                        movement_results[detailed_movement][ms_str].append(tensor_to_python(error))
+
+                        # Per-joint analysis at 400ms
+                        if ms == 400 and frame < fut.shape[1]:
+                            for j in range(pred_fut.shape[-1]):
+                                if j not in MASKED_JOINTS:
+                                    joint_name = JOINT_NAMES[j]
+                                    joint_error = (pred_fut[0, frame, j] - fut[0, frame, j]).abs().item()
+                                    
+                                    if joint_name not in joint_results:
+                                        joint_results[joint_name] = []
+                                    
+                                    joint_results[joint_name].append(tensor_to_python(joint_error))
                 
-                # Visualization (limited to first few samples)
-                try:
-                    if batch_idx < 3 and i == 0:
-                        visualize_predictions(pred_fut[0], fut[0], batch_idx, 
-                                            f"{exercise_table} - Movement {movement_id}", NUM_JOINTS)
-                except (NameError, ImportError):
-                    pass  # Skip visualization if function not available
+                # Trajectory visualization (limited to first few samples)
+                if batch_idx < 3 and i == 0:
+                    try:
+                        visualize_trajectories(pred_fut[0].cpu(), fut[0].cpu(), 
+                                              f"{os.path.join(plots_dir, f'trajectory_batch{batch_idx}.png')}",
+                                              f"{exercise_table} - {movement_name}")
+                    except Exception as e:
+                        print(f"Could not visualize trajectory: {e}")
     
     # Calculate average metrics by exercise table
-    overall_results = {ms: [] for ms in EVAL_MS}
+    overall_results = {str(ms): [] for ms in eval_ms}
+    
     for table, metrics in table_results.items():
-        for ms, errors in metrics.items():
+        for ms_str, errors in metrics.items():
             if errors:
                 avg_error = sum(errors) / len(errors)
-                overall_results[ms].append(avg_error)
+                overall_results[ms_str].append(avg_error)
     
     # Compute overall averages
-    overall_avg = {ms: sum(errors)/len(errors) if errors else float('nan') for ms, errors in overall_results.items()}
+    overall_avg = {ms_str: sum(errors)/len(errors) if errors else float('nan') 
+                 for ms_str, errors in overall_results.items()}
     
     # Print results in format similar to papers - grouped by exercise table
     print("\n----- Evaluation Results (MAE) by Exercise Table -----")
-    header = ["Table"] + [f"{ms}ms" for ms in EVAL_MS]
+    header = ["Table"] + [f"{ms}ms" for ms in eval_ms]
     print("  ".join(f"{h:<12}" for h in header))
     print("-" * 100)
     
     for table, metrics in table_results.items():
         row = [table[:12]]
-        for ms in EVAL_MS:
-            if metrics[ms]:
-                row.append(f"{sum(metrics[ms])/len(metrics[ms]):.4f}")
+        for ms in eval_ms:
+            ms_str = str(ms)
+            if ms_str in metrics and metrics[ms_str]:
+                row.append(f"{sum(metrics[ms_str])/len(metrics[ms_str]):.4f}")
             else:
                 row.append("N/A")
         print("  ".join(f"{r:<12}" for r in row))
     
     print("-" * 100)
     row = ["Average"]
-    for ms in EVAL_MS:
-        if overall_results[ms]:
-            row.append(f"{overall_avg[ms]:.4f}")
+    for ms in eval_ms:
+        ms_str = str(ms)
+        if ms_str in overall_avg and not np.isnan(overall_avg[ms_str]):
+            row.append(f"{overall_avg[ms_str]:.4f}")
         else:
             row.append("N/A")
     print("  ".join(f"{r:<12}" for r in row))
@@ -190,140 +227,304 @@ def evaluate_model(model, dataset,
     print("\n----- Top 5 Best/Worst Movements (at 400ms) -----")
     
     # Get all detailed categories with their average error at 400ms
-    movement_errors = []
-    for category, metrics in detailed_results.items():
-        if metrics[400] and len(metrics[400]) >= 5:  # Only consider categories with enough samples
-            avg_error = sum(metrics[400]) / len(metrics[400])
-            movement_errors.append((category, avg_error))
+    movement_error_400ms = []
+    for movement, metrics in movement_results.items():
+        if "400" in metrics and metrics["400"] and len(metrics["400"]) >= 3:  # Only consider categories with enough samples
+            avg_error = sum(metrics["400"]) / len(metrics["400"])
+            movement_error_400ms.append((movement, avg_error))
     
     # Sort by error (ascending)
-    movement_errors.sort(key=lambda x: x[1])
+    movement_error_400ms.sort(key=lambda x: x[1])
     
     # Display best 5
     print("Best performing movements:")
-    for i, (category, error) in enumerate(movement_errors[:5]):
-        print(f"{i+1}. {category}: {error:.4f}")
+    for i, (movement, error) in enumerate(movement_error_400ms[:5]):
+        print(f"{i+1}. {movement}: {error:.4f}")
     
     # Display worst 5
     print("\nWorst performing movements:")
-    for i, (category, error) in enumerate(movement_errors[-5:]):
-        print(f"{i+1}. {category}: {error:.4f}")
+    for i, (movement, error) in enumerate(movement_error_400ms[-5:]):
+        print(f"{i+1}. {movement}: {error:.4f}")
     
-    # Export results to CSV for paper tables
-    try:
-        os.makedirs(output_dir, exist_ok=True)
+    # Generate thesis-specific outputs
+    
+    # 1. Overall performance table (Table ref:overall_performance)
+    with open(f'{output_dir}/overall_performance_table.csv', 'w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(['Time Horizon', 'Mean Absolute Error (radians)'])
         
-        # Export table-based results
-        with open(f'{output_dir}/evaluation_results_by_table.csv', 'w', newline='') as csvfile:
-            writer = csv.writer(csvfile)
-            writer.writerow(['Exercise Table'] + [f'{ms}ms' for ms in EVAL_MS])
-            
-            for table, metrics in table_results.items():
-                row = [table]
-                for ms in EVAL_MS:
-                    if metrics[ms]:
-                        row.append(sum(metrics[ms]) / len(metrics[ms]))
-                    else:
-                        row.append('N/A')
-                writer.writerow(row)
-            
-            # Add average row
-            avg_row = ['Average']
-            for ms in EVAL_MS:
-                if overall_results[ms]:
-                    avg_row.append(sum(overall_results[ms]) / len(overall_results[ms]))
-                else:
-                    avg_row.append('N/A')
-            writer.writerow(avg_row)
+        for ms in eval_ms:
+            ms_str = str(ms)
+            if ms_str in overall_avg and not np.isnan(overall_avg[ms_str]):
+                writer.writerow([f"{ms}ms", f"{overall_avg[ms_str]:.4f}"])
+    
+    # 2. Error progression figure (Fig ref:error_progression)
+    plt.figure(figsize=(10, 6))
+    
+    x_values = []
+    y_values = []
+    
+    for ms in eval_ms:
+        ms_str = str(ms)
+        if ms_str in overall_avg and not np.isnan(overall_avg[ms_str]):
+            x_values.append(ms)
+            y_values.append(overall_avg[ms_str])
+    
+    plt.plot(x_values, y_values, 'o-', linewidth=2)
+    plt.xlabel('Prediction Horizon (ms)')
+    plt.ylabel('Mean Absolute Error (radians)')
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.title('Error Progression Over Prediction Time Horizon')
+    plt.savefig(f'{plots_dir}/error_progression.png', dpi=300)
+    plt.close()
+    
+    # 3. Movement comparison figure (Fig ref:movement_comparison)
+    plt.figure(figsize=(14, 8))
+    
+    # Get top and bottom movements
+    selected_movements = [m for m, _ in movement_error_400ms[:5] + movement_error_400ms[-5:]]
+    
+    for movement in selected_movements:
+        x = []
+        y = []
         
-        # Export detailed results
-        with open(f'{output_dir}/evaluation_results_detailed.csv', 'w', newline='') as csvfile:
+        for ms in eval_ms:
+            ms_str = str(ms)
+            if ms_str in movement_results[movement] and movement_results[movement][ms_str]:
+                avg_error = sum(movement_results[movement][ms_str]) / len(movement_results[movement][ms_str])
+                x.append(ms)
+                y.append(avg_error)
+        
+        # Truncate movement name for better display
+        display_name = movement[:25] + "..." if len(movement) > 25 else movement
+        plt.plot(x, y, 'o-', label=display_name)
+    
+    plt.xlabel('Prediction Horizon (ms)')
+    plt.ylabel('Mean Absolute Error (radians)')
+    plt.title('Performance Comparison Across Movement Types')
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
+    plt.tight_layout()
+    plt.savefig(f'{plots_dir}/movement_comparison.png', dpi=300)
+    plt.close()
+    
+    # 4. Joint error analysis (Fig ref:joint_error)
+    if joint_results:
+        # Calculate average error per joint
+        joint_avg_errors = {joint: sum(errors)/len(errors) if errors else 0 
+                          for joint, errors in joint_results.items()}
+        
+        # Sort joints by name to maintain anatomical order
+        sorted_joints = sorted(joint_avg_errors.keys(), key=lambda j: JOINT_NAMES.index(j) if j in JOINT_NAMES else 999)
+        
+        # Define joint groups
+        joint_groups = {
+            'Wrist': ['WRJ1', 'WRJ2'],
+            'Thumb': ['THJ1', 'THJ2', 'THJ3', 'THJ4', 'THJ5'],
+            'Index': ['FFJ1', 'FFJ2', 'FFJ3', 'FFJ4'],
+            'Middle': ['MFJ1', 'MFJ2', 'MFJ3', 'MFJ4'],
+            'Ring': ['RFJ1', 'RFJ2', 'RFJ3', 'RFJ4'],
+            'Little': ['LFJ1', 'LFJ2', 'LFJ3', 'LFJ4', 'LFJ5']
+        }
+        
+        # Assign colors to joint groups
+        group_colors = {
+            'Wrist': 'blue',
+            'Thumb': 'green',
+            'Index': 'red',
+            'Middle': 'orange',
+            'Ring': 'purple',
+            'Little': 'brown'
+        }
+        
+        # Determine color for each joint
+        colors = []
+        for joint in sorted_joints:
+            color_assigned = False
+            for group, joints in joint_groups.items():
+                if joint in joints:
+                    colors.append(group_colors[group])
+                    color_assigned = True
+                    break
+            if not color_assigned:
+                colors.append('gray')
+        
+        # Create figure
+        plt.figure(figsize=(12, 6))
+        plt.bar(sorted_joints, [joint_avg_errors[j] for j in sorted_joints], color=colors)
+        plt.xticks(rotation=45, ha='right')
+        plt.title("Per-Joint Prediction Error")
+        plt.ylabel("Mean Absolute Error (radians)")
+        plt.grid(True, axis='y', linestyle='--', alpha=0.7)
+        
+        # Add legend for joint groups
+        handles = [plt.Rectangle((0,0),1,1, color=color) for color in group_colors.values()]
+        plt.legend(handles, group_colors.keys(), loc='upper right')
+        
+        plt.tight_layout()
+        plt.savefig(f'{plots_dir}/per_joint_error.png', dpi=300)
+        plt.close()
+        
+        # 5. Joint group analysis (Table ref:joint_group)
+        joint_group_errors = {group: [] for group in joint_groups}
+        
+        for joint, errors in joint_results.items():
+            for group, joints in joint_groups.items():
+                if joint in joints and errors:
+                    joint_group_errors[group].extend(errors)
+        
+        # Generate joint group table
+        with open(f'{output_dir}/joint_group_analysis.csv', 'w', newline='') as csvfile:
             writer = csv.writer(csvfile)
-            writer.writerow(['Table_Movement'] + [f'{ms}ms' for ms in EVAL_MS])
+            writer.writerow(['Joint Group', 'Mean Error', 'Max Error', 'Min Error', 'Std Deviation'])
             
-            for category, metrics in detailed_results.items():
-                row = [category]
-                for ms in EVAL_MS:
-                    if metrics[ms]:
-                        row.append(sum(metrics[ms]) / len(metrics[ms]))
-                    else:
-                        row.append('N/A')
-                writer.writerow(row)
+            for group, errors in joint_group_errors.items():
+                if errors:
+                    writer.writerow([
+                        group,
+                        f"{np.mean(errors):.4f}",
+                        f"{np.max(errors):.4f}",
+                        f"{np.min(errors):.4f}",
+                        f"{np.std(errors):.4f}"
+                    ])
+    
+    # 6. DCT coefficient analysis (Table ref:dct_coefficients)
+    if sample_input_dct is not None and sample_baseline_dct is not None and sample_pred_residual is not None:
+        # Number of coefficients to analyze
+        num_coeffs = min(20, sample_input_dct.shape[1])
+        
+        # Calculate average magnitude across batch and joints
+        input_mag = sample_input_dct[:, :num_coeffs, :].abs().mean(dim=(0, 2)).numpy()
+        baseline_mag = sample_baseline_dct[:, :num_coeffs, :].abs().mean(dim=(0, 2)).numpy()
+        residual_mag = sample_pred_residual[:, :num_coeffs, :].abs().mean(dim=(0, 2)).numpy()
+        
+        # Save in CSV format for paper table
+        with open(f'{output_dir}/dct_coefficient_analysis.csv', 'w', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(['Coefficient Index', 'Input Magnitude', 'Baseline Magnitude', 'Residual Magnitude'])
             
-        print(f"Results exported to {output_dir}/evaluation_results_by_table.csv and {output_dir}/evaluation_results_detailed.csv")
-    except Exception as e:
-        print(f"Could not export results to CSV: {e}")
+            for i in range(num_coeffs):
+                writer.writerow([
+                    i, 
+                    f"{input_mag[i]:.6f}", 
+                    f"{baseline_mag[i]:.6f}", 
+                    f"{residual_mag[i]:.6f}"
+                ])
+        
+        # Create visualization
+        plt.figure(figsize=(10, 6))
+        
+        x = np.arange(num_coeffs)
+        plt.plot(x, input_mag, 'o-', label='Input DCT Coefficients', linewidth=2)
+        plt.plot(x, baseline_mag, 's--', label='Baseline DCT Coefficients', linewidth=2)
+        plt.plot(x, residual_mag, '^-', label='Predicted Residual Coefficients', linewidth=2)
+        
+        plt.xlabel('DCT Coefficient Index')
+        plt.ylabel('Average Magnitude')
+        plt.title('DCT Coefficient Magnitude Analysis')
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.legend()
+        
+        plt.tight_layout()
+        plt.savefig(f'{plots_dir}/dct_coefficient_analysis.png', dpi=300)
+        plt.close()
     
-    # Additional analysis and visualizations
-    print("\n----- Generating Additional Analysis -----")
-    
-    # Create directories for output
-    plots_dir = os.path.join(os.path.dirname(output_dir), "plots")
-    os.makedirs(plots_dir, exist_ok=True)
-    
-    # Only proceed with additional analysis if we have data and evaluation utilities
+    # Create qualitative trajectory visualizations
     if all_preds and all_targets:
         try:
-            # 1. Per-Joint Error Analysis
-            try:
-                # Stack first few predictions and targets
-                stacked_preds = torch.cat(all_preds[:5], dim=0)
-                stacked_targets = torch.cat(all_targets[:5], dim=0)
-                # Create mask on CPU
-                cpu_mask = torch.ones(stacked_preds.shape[-1], dtype=torch.bool)
-                cpu_mask[MASKED_JOINTS] = False
-                
-                plot_per_joint_error(stacked_preds, stacked_targets, cpu_mask, JOINT_NAMES)
-                print("✅ Generated per-joint error analysis")
-            except (NameError, ImportError) as e:
-                print(f"Could not generate per-joint error analysis: {e}")
-                
-            # 2. Error Progression Analysis
-            try:
-                plot_error_progression_by_frame(stacked_preds, stacked_targets, cpu_mask)
-                print("✅ Generated error progression analysis")
-            except (NameError, ImportError) as e:
-                print(f"Could not generate error progression analysis: {e}")
-            
-            # 3. Action Comparison Visualization
-            try:
-                plot_action_comparison(table_results, EVAL_MS)
-                print("✅ Generated action comparison visualization")
-            except (NameError, ImportError) as e:
-                print(f"Could not generate action comparison: {e}")
-            
-            # 4. Detailed Error Table
-            try:
-                # Generate for both table results and detailed results
-                generate_detailed_error_table(table_results, EVAL_MS, output_path=f'{output_dir}/table_error_breakdown.csv')
-                generate_detailed_error_table(detailed_results, EVAL_MS, output_path=f'{output_dir}/movement_error_breakdown.csv')
-                print("✅ Generated detailed error tables")
-            except (NameError, ImportError) as e:
-                print(f"Could not generate detailed error tables: {e}")
-            
-            # 5. Joint Group Analysis
-            try:
-                generate_joint_group_table(stacked_preds, stacked_targets, JOINT_NAMES)
-                print("✅ Generated joint group analysis")
-            except (NameError, ImportError) as e:
-                print(f"Could not generate joint group analysis: {e}")
-            
-            # 6. DCT Coefficient Analysis
-            if sample_input_dct is not None and sample_baseline_dct is not None and sample_pred_residual is not None:
-                try:
-                    analyze_dct_coefficients(sample_input_dct, sample_baseline_dct, sample_pred_residual)
-                    print("✅ Generated DCT coefficient analysis")
-                except (NameError, ImportError) as e:
-                    print(f"Could not generate DCT coefficient analysis: {e}")
-        
+            # Combined qualitative analysis
+            visualize_qualitative_comparison(all_preds[:3], all_targets[:3], 
+                                            [m.get('movement_name', 'Unknown') for m in all_metadata[:3]],
+                                            f"{plots_dir}/qualitative_comparison.png")
         except Exception as e:
-            print(f"Error during additional analysis: {e}")
-    else:
-        print("⚠️ No samples available for additional analysis")
+            print(f"Could not generate qualitative comparison: {e}")
     
-    # Return the computed metrics
-    return {
+    # Return the computed metrics in a structured format
+    return tensor_to_python ({
         "by_table": table_results,
-        "by_movement": detailed_results,
+        "by_movement": movement_results,
+        "by_joint": joint_results,
         "overall": overall_avg
-    }
+    })
+
+
+def visualize_trajectories(pred, target, output_path, title="Joint Trajectories"):
+    """Visualize trajectories of key joints over time.
+    
+    Args:
+        pred: Predicted poses tensor
+        target: Ground truth poses tensor
+        output_path: Path to save the figure
+        title: Title for the figure
+    """
+    plt.figure(figsize=(15, 10))
+    
+    # Select representative joints
+    key_joints = [0, 6, 10, 14, 18, 23]  # Wrist, Thumb tip, Index tip, Middle tip, Ring tip, Little tip
+    joint_labels = ["Wrist (WRJ1)", "Thumb tip (THJ5)", "Index tip (FFJ4)", 
+                   "Middle tip (MFJ4)", "Ring tip (RFJ4)", "Little tip (LFJ5)"]
+    
+    for j_idx, joint_idx in enumerate(key_joints):
+        plt.subplot(len(key_joints), 1, j_idx + 1)
+        plt.plot(target[:, joint_idx].cpu().numpy(), 'g-', label='Ground Truth')
+        plt.plot(pred[:, joint_idx].cpu().numpy(), 'r--', label='Prediction')
+        plt.title(f"{joint_labels[j_idx]} Trajectory")
+        if j_idx == 0:
+            plt.legend()
+    
+    plt.suptitle(title)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300)
+    plt.close()
+
+def visualize_qualitative_comparison(preds, targets, movement_names, output_path):
+    """Create a side-by-side comparison of predicted vs ground truth poses.
+    
+    Args:
+        preds: List of prediction tensors
+        targets: List of target tensors
+        movement_names: List of movement names
+        output_path: Path to save the figure
+    """
+    num_samples = len(preds)
+    time_points = [0, 10, 20, 30]  # Frames to visualize
+    
+    fig, axes = plt.subplots(num_samples, len(time_points), figsize=(len(time_points)*4, num_samples*3))
+    
+    for i in range(num_samples):
+        pred = preds[i].numpy()
+        target = targets[i].numpy()
+        
+        for j, frame in enumerate(time_points):
+            if frame < pred.shape[0]:
+                ax = axes[i, j] if num_samples > 1 else axes[j]
+                
+                # Plot ground truth and prediction for this frame
+                ax.plot(range(pred.shape[1]), target[frame], 'g-', alpha=0.7, label='Ground Truth')
+                ax.plot(range(pred.shape[1]), pred[frame], 'r--', alpha=0.7, label='Prediction')
+                
+                ax.set_title(f"{movement_names[i]}\nFrame {frame}")
+                if i == 0 and j == 0:
+                    ax.legend()
+                
+                ax.set_xticks([])
+                ax.set_ylim(-3, 3)
+    
+    plt.suptitle("Qualitative Comparison: Ground Truth vs Prediction")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300)
+    plt.close()
+
+
+def tensor_to_python(value):
+    """Convert tensor values to native Python types."""
+    if hasattr(value, 'item'):  # Check if it's a tensor
+        try:
+            return value.item()  # For scalar tensors
+        except ValueError:
+            return str(value)    # For non-scalar tensors
+    elif isinstance(value, (list, tuple)):
+        return [tensor_to_python(v) for v in value]
+    elif isinstance(value, dict):
+        return {str(k): tensor_to_python(v) for k, v in value.items()}
+    return value
